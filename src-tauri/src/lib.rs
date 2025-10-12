@@ -6,8 +6,7 @@ use std::{env, fs::{self, File}, io::{Read, Write, Seek, SeekFrom}, path::{Path,
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
-#[cfg(target_os = "macos")]
-use objc::{msg_send, sel, sel_impl};
+ 
 use std::collections::HashMap;
 use std::process::{Command, Stdio, Child};
 use std::{thread, time::Duration};
@@ -634,44 +633,7 @@ fn read_logs_tail(lines: usize) -> Result<String, String> {
     Ok(v[v.len()-n..].join("\n"))
 }
 
-// Dock badge (macOS): show/hide label in Dock icon (badge bubble); quick visual label indicator
-#[tauri::command]
-fn dock_set_badge(label: &str) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    unsafe {
-        use cocoa::appkit::NSApp;
-        use cocoa::base::{id, nil};
-        use cocoa::foundation::NSString;
-        let app: id = NSApp();
-        if app == nil { return Ok(()); }
-        let dock: id = msg_send![app, dockTile];
-        let ns: id = NSString::alloc(nil).init_str(label);
-        let _: () = msg_send![dock, setBadgeLabel: ns];
-        let _: () = msg_send![dock, display];
-        write_log("INFO", &format!("dock_set_badge label={}", label));
-        return Ok(());
-    }
-    #[cfg(not(target_os = "macos"))]
-    { let _ = label; Ok(()) }
-}
-
-#[tauri::command]
-fn dock_clear_badge() -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    unsafe {
-        use cocoa::appkit::NSApp;
-        use cocoa::base::{id, nil};
-        let app: id = NSApp();
-        if app == nil { return Ok(()); }
-        let dock: id = msg_send![app, dockTile];
-        let _: () = msg_send![dock, setBadgeLabel: nil];
-        let _: () = msg_send![dock, display];
-        write_log("INFO", "dock_clear_badge");
-        return Ok(());
-    }
-    #[cfg(not(target_os = "macos"))]
-    { Ok(()) }
-}
+ 
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -694,9 +656,7 @@ pub fn run() {
             browser_close,
             browser_exists,
             browser_running,
-            read_logs_tail,
-            dock_set_badge,
-            dock_clear_badge
+            read_logs_tail
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

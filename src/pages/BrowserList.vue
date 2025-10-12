@@ -68,13 +68,11 @@ async function toggleOpen(p: BrowserProfile) {
       p.status = "closing"; save();
       await invoke("browser_close", { label: p.id });
       p.status = "closed"; p.opened = false; save();
-      try { const anyOpen = state.profiles.some(x => x.status === 'open' || x.status === 'opening'); if (!anyOpen) await invoke("dock_clear_badge"); } catch {}
     } else {
       p.status = "opening"; save();
       await invoke("log_info", { message: `[BrowserList] try open label=${p.id} version=${p.engineVersion || 'N/A'}` });
       const pid = await invoke<number | null>("browser_open", { label: p.id, url: null, version: p.engineVersion || null });
       if (pid && typeof pid === 'number') { (p as any).pid = pid; }
-      try { await invoke("dock_set_badge", { label: p.id }); } catch {}
       p.status = "open"; p.opened = true; p.lastOpenedAt = new Date().toISOString(); save();
     }
   } catch (e:any) {
@@ -158,7 +156,7 @@ async function bulkClose() {
       p.status = "closing"; save();
       await invoke("browser_close", { label: p.id });
       p.status = "closed"; p.opened = false; save();
-      try { const anyOpen = state.profiles.some(x => x.status === 'open' || x.status === 'opening'); if (!anyOpen) await invoke("dock_clear_badge"); } catch {}
+      
     } catch {}
   }
 }
