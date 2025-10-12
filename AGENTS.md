@@ -67,7 +67,7 @@ pnpm format:check
 
 ### 📋 开发任务清单
 
-详细的开发任务请参见 [`DEVELOPMENT_TASKS.md`](./DEVELOPMENT_TASKS.md) 文件
+详细的开发任务请参见 [`DEVELOPMENT_TASKS.md`](./work_doc/DEVELOPMENT_TASKS.md) 文件
 
 ---
 
