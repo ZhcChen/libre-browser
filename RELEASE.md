@@ -23,6 +23,16 @@ source "$HOME/.cargo/env"
 curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.0/install.sh | bash
 nvm install 18
 nvm use 18
+
+# Ubuntu/Debian 系统依赖
+sudo apt-get update
+sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+# macOS 系统依赖
+xcode-select --install
+
+# Windows 系统依赖
+# 使用 Visual Studio Build Tools 或 Visual Studio Community
 ```
 
 ### 克隆仓库
