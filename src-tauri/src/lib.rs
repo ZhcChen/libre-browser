@@ -1520,6 +1520,7 @@ fn try_find_pid_by_profile(profile_dir: &Path, timeout_ms: u64) -> Option<u32> {
 }
 
 #[cfg(not(target_os = "macos"))]
+#[allow(dead_code)]
 fn try_find_pid_by_profile(_profile_dir: &Path, _timeout_ms: u64) -> Option<u32> {
     None
 }
