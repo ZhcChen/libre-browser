@@ -168,11 +168,7 @@ fn ensure_dir(p: &PathBuf) {
 fn tail_file_lines(path: &Path, max_lines: usize, max_bytes: usize) -> Option<String> {
     let mut f = File::open(path).ok()?;
     let len = f.metadata().ok()?.len();
-    let start = if len > max_bytes as u64 {
-        len - max_bytes as u64
-    } else {
-        0
-    };
+    let start = len.saturating_sub(max_bytes as u64);
     if start > 0 {
         let _ = f.seek(SeekFrom::Start(start));
     }
@@ -193,7 +189,7 @@ fn is_probably_version(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_ascii_digit() || c == '.')
 }
 
-fn extract_zip_to<R: Read + std::io::Seek>(mut reader: R, dest: &PathBuf) -> Result<(), String> {
+fn extract_zip_to<R: Read + std::io::Seek>(mut reader: R, dest: &Path) -> Result<(), String> {
     let mut archive =
         zip::ZipArchive::new(&mut reader).map_err(|e| format!("open zip failed: {e}"))?;
     for i in 0..archive.len() {
@@ -413,7 +409,7 @@ fn download_engine(version: &str, url: &str) -> Result<String, String> {
         let _ = fs::remove_file(&tmp_path);
     } else {
         // keep the downloaded file inside dest_dir
-        let filename = url.split('/').last().unwrap_or("download.bin");
+        let filename = url.split('/').next_back().unwrap_or("download.bin");
         let target = dest_dir.join(filename);
         fs::rename(&tmp_path, &target).map_err(|e| format!("move file failed: {e}"))?;
     }
@@ -1023,7 +1019,7 @@ fn browser_open(
             let hash = hasher.finalize();
             let icon_index = (hash[0] as usize) % 1000; // 0-999的索引
 
-            match generate_browser_icon(&display_name, icon_index) {
+            match generate_browser_icon(display_name, icon_index) {
                 Ok(icon_path) => {
                     // 创建自定义App Bundle
                     match bin
@@ -1032,7 +1028,7 @@ fn browser_open(
                         .and_then(|p| p.parent())
                     {
                         Some(source_app) => {
-                            match create_custom_app_bundle(&source_app, &display_name, &icon_path) {
+                            match create_custom_app_bundle(source_app, display_name, &icon_path) {
                                 Ok(custom_app) => {
                                     // 获取自定义app目录
                                     let app_dir = custom_app.parent().map(|p| p.to_path_buf());
@@ -1494,7 +1490,7 @@ fn browser_running(label: &str) -> Option<u32> {
 }
 
 #[cfg(target_os = "macos")]
-fn try_find_pid_by_profile(profile_dir: &PathBuf, timeout_ms: u64) -> Option<u32> {
+fn try_find_pid_by_profile(profile_dir: &Path, timeout_ms: u64) -> Option<u32> {
     let end = std::time::Instant::now() + Duration::from_millis(timeout_ms);
     while std::time::Instant::now() < end {
         // Use ps to search processes containing the profile dir path
@@ -1507,7 +1503,7 @@ fn try_find_pid_by_profile(profile_dir: &PathBuf, timeout_ms: u64) -> Option<u32
                             && (line.contains("Google Chrome for Testing")
                                 || line.contains("Chromium"))
                         {
-                            let pid_str = line.trim().split_whitespace().next().unwrap_or("");
+                            let pid_str = line.split_whitespace().next().unwrap_or("");
                             if let Ok(pid) = pid_str.parse::<u32>() {
                                 return Some(pid);
                             }
@@ -1522,7 +1518,7 @@ fn try_find_pid_by_profile(profile_dir: &PathBuf, timeout_ms: u64) -> Option<u32
 }
 
 #[cfg(not(target_os = "macos"))]
-fn try_find_pid_by_profile(_profile_dir: &PathBuf, _timeout_ms: u64) -> Option<u32> {
+fn try_find_pid_by_profile(_profile_dir: &Path, _timeout_ms: u64) -> Option<u32> {
     None
 }
 
