@@ -33,19 +33,19 @@ jobs:
       uses: actions/cache@v4
       with:
         path: ~/.cargo/registry
-        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('src-tauri/Cargo.lock') }}
 
     - name: Cache cargo index
       uses: actions/cache@v4
       with:
         path: ~/.cargo/git
-        key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+        key: ${{ runner.os }}-cargo-index-${{ hashFiles('src-tauri/Cargo.lock') }}
 
     - name: Cache cargo target
       uses: actions/cache@v4
       with:
-        path: target
-        key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+        path: src-tauri/target
+        key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('src-tauri/Cargo.lock') }}
 
     - name: Install frontend dependencies
       working-directory: ./src
@@ -53,12 +53,15 @@ jobs:
 
     - name: Run tests
       run: cargo test
+      working-directory: ./src-tauri
 
     - name: Check formatting
       run: cargo fmt --all -- --check
+      working-directory: ./src-tauri
 
     - name: Run clippy
       run: cargo clippy -- -D warnings
+      working-directory: ./src-tauri
 
   build:
     name: Build Application
@@ -95,19 +98,19 @@ jobs:
       uses: actions/cache@v4
       with:
         path: ~/.cargo/registry
-        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('src-tauri/Cargo.lock') }}
 
     - name: Cache cargo index
       uses: actions/cache@v4
       with:
         path: ~/.cargo/git
-        key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+        key: ${{ runner.os }}-cargo-index-${{ hashFiles('src-tauri/Cargo.lock') }}
 
     - name: Cache cargo target
       uses: actions/cache@v4
       with:
-        path: target
-        key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+        path: src-tauri/target
+        key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('src-tauri/Cargo.lock') }}
 
     - name: Install frontend dependencies
       working-directory: ./src
