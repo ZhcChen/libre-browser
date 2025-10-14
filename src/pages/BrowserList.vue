@@ -25,6 +25,10 @@ const search = ref("");
 const selected = reactive(new Set<string>());
 const state = reactive({ profiles: [] as BrowserProfile[] });
 const STORAGE_KEY = "libre_browser_profiles";
+// 最短过渡展示时长，保证“开启中/关闭中”至少可见一帧
+const TRANSIENT_MIN_MS = 150;
+// 记录每个 profile 进入过渡态的时间戳
+const transitionAt = new Map<string, number>();
 
 function load() {
   try {
@@ -44,6 +48,12 @@ function load() {
   }
 }
 function save() { localStorage.setItem(STORAGE_KEY, JSON.stringify(state.profiles)); }
+// 延迟保存，避免在点击瞬间阻塞渲染
+let saveTimer: number | undefined;
+function saveLater(delay = 0) {
+  if (saveTimer) window.clearTimeout(saveTimer);
+  saveTimer = window.setTimeout(() => { saveTimer = undefined; save(); }, delay);
+}
 // 保留历史结构，实际存在检测使用 p.id
 async function isWindowOpen(label: string) {
   try { return await invoke<boolean>("browser_exists", { label }); } catch { return false; }
@@ -65,20 +75,41 @@ async function toggleOpen(p: BrowserProfile) {
   if (p.status === "opening" || p.status === "closing") return;
   try {
     if (p.status === "open") {
-      p.status = "closing"; save();
-      await invoke("browser_close", { label: p.id });
-      p.status = "closed"; p.opened = false; save();
+      // 立即设置为关闭中状态
+      p.status = "closing";
+      transitionAt.set(p.id, Date.now());
+      p.opened = false;
+      saveLater(0);
+      // 启动高频轮询
+      startFastPolling(p.id);
+      // 异步执行关闭命令，不阻塞UI更新
+      invoke("browser_close", { label: p.id }).catch(async (err: any) => {
+        // 关闭失败，恢复为开启状态
+        p.status = "open";
+        p.opened = true;
+        save();
+        stopFastPolling(p.id);
+        transitionAt.delete(p.id);
+        try { await invoke("log_info", { message: `[BrowserList] close failed: ${err?.message || String(err)}` }); } catch {}
+      });
+      // 不立即设置为 closed，让高频轮询检测到关闭后自动更新
     } else {
-      p.status = "opening"; save();
+      p.status = "opening";
+      transitionAt.set(p.id, Date.now());
+      saveLater(0);
+      // 启动高频轮询
+      startFastPolling(p.id);
       await invoke("log_info", { message: `[BrowserList] try open label=${p.id} version=${p.engineVersion || 'N/A'}` });
       const pid = await invoke<number | null>("browser_open", { label: p.id, url: null, version: p.engineVersion || null });
       if (pid && typeof pid === 'number') { (p as any).pid = pid; }
-      p.status = "open"; p.opened = true; p.lastOpenedAt = new Date().toISOString(); save();
+      // 不直接置为 open，交由轮询在达到最短展示时长后切换
     }
   } catch (e:any) {
     await invoke("log_info", { message: `[BrowserList] open/close failed: ${e?.message || String(e)}` });
     try { const tail = await invoke<string>("read_logs_tail", { lines: 120 }); console.error(tail); } catch {}
     p.status = p.opened ? "open" : "closed";
+    stopFastPolling(p.id);
+    transitionAt.delete(p.id);
   }
 }
 function statusLabel(s?: BrowserStatus) {
@@ -101,19 +132,96 @@ const showCreate = ref(false);
 function createProfile() { showCreate.value = true; }
 
 let timer: number | undefined;
+// 高频轮询管理：每个浏览器可以有自己的独立高频轮询
+const fastPollingTimers = reactive(new Map<string, { timer: number; startTime: number }>());
+
+// 启动单个浏览器的高频轮询（10ms 间隔，最长 10 秒）
+function startFastPolling(profileId: string) {
+  // 如果已存在，先清除
+  stopFastPolling(profileId);
+  
+  const startTime = Date.now();
+  const timer = window.setInterval(async () => {
+    // 检查是否超过 10 秒
+    if (Date.now() - startTime > 10000) {
+      stopFastPolling(profileId);
+      return;
+    }
+    
+    // 检查这个 profile 的状态
+    const p = state.profiles.find(x => x.id === profileId);
+    if (!p) {
+      stopFastPolling(profileId);
+      return;
+    }
+    
+    // 检测状态
+    let cur = false;
+    try { 
+      const running = await invoke<number | null>("browser_running", { label: p.id }); 
+      if (typeof running === 'number' && running > 0) { 
+        (p as any).pid = running; 
+        cur = true; 
+      } 
+    } catch {}
+    
+    if (!cur) { 
+      try { cur = await isWindowOpen(p.id); } catch {} 
+    }
+    
+    const started = transitionAt.get(profileId) || 0;
+    const allowSwitch = !started || (Date.now() - started >= TRANSIENT_MIN_MS);
+    // 更新状态
+    if (p.status === "opening" && cur && allowSwitch) { 
+      p.status = "open"; 
+      p.opened = true; 
+      p.lastOpenedAt = p.lastOpenedAt || new Date().toISOString();
+      save();
+      transitionAt.delete(profileId);
+      stopFastPolling(profileId); // 状态稳定了，停止高频轮询
+    } else if (p.status === "closing" && !cur && allowSwitch) { 
+      p.status = "closed"; 
+      p.opened = false;
+      save();
+      transitionAt.delete(profileId);
+      stopFastPolling(profileId); // 状态稳定了，停止高频轮询
+    }
+  }, 10);
+  
+  fastPollingTimers.set(profileId, { timer, startTime });
+}
+
+// 停止单个浏览器的高频轮询
+function stopFastPolling(profileId: string) {
+  const entry = fastPollingTimers.get(profileId);
+  if (entry) {
+    window.clearInterval(entry.timer);
+    fastPollingTimers.delete(profileId);
+  }
+}
+
+// 全局低频轮询（1 秒间隔）
 async function refreshStatusesOnce() {
   for (const p of state.profiles) {
     let cur = false;
     try { const running = await invoke<number | null>("browser_running", { label: p.id }); if (typeof running === 'number' && running > 0) { (p as any).pid = running; cur = true; } } catch {}
     if (!cur) { try { cur = await isWindowOpen(p.id); } catch {} }
-    if (p.status === "opening" && cur) { p.status = "open"; p.opened = true; p.lastOpenedAt = p.lastOpenedAt || new Date().toISOString(); }
-    else if (p.status === "closing" && !cur) { p.status = "closed"; p.opened = false; }
+    const started = transitionAt.get(p.id) || 0;
+    const allowSwitch = !started || (Date.now() - started >= TRANSIENT_MIN_MS);
+    if (p.status === "opening" && cur && allowSwitch) { p.status = "open"; p.opened = true; p.lastOpenedAt = p.lastOpenedAt || new Date().toISOString(); transitionAt.delete(p.id); }
+    else if (p.status === "closing" && !cur && allowSwitch) { p.status = "closed"; p.opened = false; transitionAt.delete(p.id); }
     else if (p.status !== "opening" && p.status !== "closing") { p.status = cur ? "open" : "closed"; p.opened = cur; }
   }
   save();
 }
 onMounted(() => { load(); refreshStatusesOnce(); timer = window.setInterval(async () => { await refreshStatusesOnce(); }, 1000); });
-onBeforeUnmount(() => { if (timer) window.clearInterval(timer); });
+onBeforeUnmount(() => { 
+  if (timer) window.clearInterval(timer); 
+  // 清除所有高频轮询
+  for (const [id, _] of fastPollingTimers) {
+    stopFastPolling(id);
+  }
+});
 
 const filtered = computed(() => { const q = search.value.trim().toLowerCase(); if (!q) return state.profiles; return state.profiles.filter((p) => p.id.toLowerCase().includes(q) || p.name.toLowerCase().includes(q)); });
 const allSelected = computed(() => filtered.value.length > 0 && filtered.value.every((p) => selected.has(p.id)));
@@ -140,25 +248,46 @@ async function bulkOpen() {
     if (!selected.has(p.id)) continue;
     if (p.status === "open" || p.status === "opening") continue;
     try {
-      p.status = "opening"; save();
+      p.status = "opening"; transitionAt.set(p.id, Date.now()); saveLater(0);
+      // 启动高频轮询
+      startFastPolling(p.id);
       await invoke("log_info", { message: `[BrowserList] bulk open label=${p.id} version=${p.engineVersion || 'N/A'}` });
       const pid = await invoke<number | null>("browser_open", { label: p.id, url: null, version: p.engineVersion || null });
       if (pid && typeof pid === 'number') { (p as any).pid = pid; }
-      p.status = "open"; p.opened = true; p.lastOpenedAt = new Date().toISOString(); save();
+      // 交由轮询切换到 open
     } catch {}
   }
 }
 async function bulkClose() {
-  for (const p of state.profiles) {
-    if (!selected.has(p.id)) continue;
-    if (p.status === "closed" || p.status === "closing") continue;
-    try {
-      p.status = "closing"; save();
-      await invoke("browser_close", { label: p.id });
-      p.status = "closed"; p.opened = false; save();
-      
-    } catch {}
+  // 收集所有需要关闭的配置
+  const targets = state.profiles.filter(p => 
+    selected.has(p.id) && p.status !== "closed" && p.status !== "closing"
+  );
+  if (targets.length === 0) return;
+  
+  // 立即设置所有目标为关闭中状态，并启动高频轮询
+  for (const p of targets) {
+    p.status = "closing";
+    transitionAt.set(p.id, Date.now());
+    p.opened = false;
+    // 为每个目标启动独立的高频轮询
+    startFastPolling(p.id);
   }
+  saveLater(0);
+  
+  // 异步执行所有关闭命令，不阻塞UI
+  for (const p of targets) {
+    invoke("browser_close", { label: p.id }).catch(async (err: any) => {
+      // 关闭失败，恢复为开启状态
+      p.status = "open";
+      p.opened = true;
+      save();
+      stopFastPolling(p.id);
+      transitionAt.delete(p.id);
+      try { await invoke("log_info", { message: `[BrowserList] bulk close failed: ${err?.message || String(err)}` }); } catch {}
+    });
+  }
+  // 不立即设置为 closed，让高频轮询检测到关闭后自动更新
 }
 
 const isDark = computed(() => resolveEffectiveTheme() === "dark");
