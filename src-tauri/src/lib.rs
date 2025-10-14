@@ -1457,6 +1457,7 @@ fn browser_exists(app: AppHandle, label: &str) -> Result<bool, String> {
     Ok(app.get_webview_window(&lbl).is_some())
 }
 
+#[allow(unused_variables)]
 fn pid_alive_unix(pid: u32) -> bool {
     #[cfg(target_family = "unix")]
     {
