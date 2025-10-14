@@ -2,7 +2,7 @@ use chrono::Local;
 use directories::ProjectDirs;
 use flate2::{write::GzEncoder, Compression};
 use once_cell::sync::OnceCell;
-#[cfg(unix)]
+#[cfg(all(unix, target_os = "macos"))]
 use std::os::unix::fs::PermissionsExt;
 use std::{
     env,
@@ -488,6 +488,7 @@ fn extract_engine_archive(version: &str) -> Result<String, String> {
     Ok(dest_dir.to_string_lossy().to_string())
 }
 
+#[cfg(target_os = "macos")]
 fn path_contains_macos_exec_dir(p: &Path) -> bool {
     let mut seen_contents = false;
     for c in p.components() {
@@ -1012,6 +1013,7 @@ fn browser_open(
     }
     if let Some(bin) = engine_bin {
         // 生成自定义图标和App Bundle（仅在macOS上）
+        #[allow(unused_variables)]
         let (custom_app, app_dir) = if cfg!(target_os = "macos") {
             // 生成唯一索引，基于标签哈希
             let mut hasher = Sha256::new();
