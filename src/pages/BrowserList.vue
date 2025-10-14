@@ -19,6 +19,7 @@ type BrowserProfile = {
   status?: BrowserStatus;
   engineVersion?: string;
   pid?: number;
+  windowTitle?: string;
 };
 
 const search = ref("");
@@ -54,9 +55,19 @@ function saveLater(delay = 0) {
   if (saveTimer) window.clearTimeout(saveTimer);
   saveTimer = window.setTimeout(() => { saveTimer = undefined; save(); }, delay);
 }
-// 保留历史结构，实际存在检测使用 p.id
+// 检查浏览器窗口是否存在，优先使用 PID 检测
 async function isWindowOpen(label: string) {
-  try { return await invoke<boolean>("browser_exists", { label }); } catch { return false; }
+  try {
+    // 首先尝试通过 PID 检测，更准确
+    const running = await invoke<number | null>("browser_running", { label });
+    if (typeof running === 'number' && running > 0) {
+      return true;
+    }
+    // PID 检测失败时，回退到窗口检测
+    return await invoke<boolean>("browser_exists", { label });
+  } catch {
+    return false;
+  }
 }
 function edit(p: BrowserProfile) { const name = window.prompt("编辑窗口名称", p.name); if (name && name.trim()) { p.name = name.trim(); save(); } }
 const confirmVisible = ref(false);
@@ -100,7 +111,15 @@ async function toggleOpen(p: BrowserProfile) {
       // 启动高频轮询
       startFastPolling(p.id);
       await invoke("log_info", { message: `[BrowserList] try open label=${p.id} version=${p.engineVersion || 'N/A'}` });
-      const pid = await invoke<number | null>("browser_open", { label: p.id, url: null, version: p.engineVersion || null });
+      // 生成显示标题：浏览器名称 + 序号（如果有多个的话）
+      const displayTitle = `${p.name} - Libre Browser`;
+      const pid = await invoke<number | null>("browser_open", {
+        label: p.id,
+        url: null,
+        version: p.engineVersion || null,
+        windowTitle: displayTitle,
+        browser_name: p.name
+      });
       if (pid && typeof pid === 'number') { (p as any).pid = pid; }
       // 不直接置为 open，交由轮询在达到最短展示时长后切换
     }
@@ -202,16 +221,52 @@ function stopFastPolling(profileId: string) {
 
 // 全局低频轮询（1 秒间隔）
 async function refreshStatusesOnce() {
-  for (const p of state.profiles) {
+  // 批量检测所有浏览器状态，减少单次调用开销
+  const statusPromises = state.profiles.map(async (p) => {
     let cur = false;
-    try { const running = await invoke<number | null>("browser_running", { label: p.id }); if (typeof running === 'number' && running > 0) { (p as any).pid = running; cur = true; } } catch {}
-    if (!cur) { try { cur = await isWindowOpen(p.id); } catch {} }
-    const started = transitionAt.get(p.id) || 0;
-    const allowSwitch = !started || (Date.now() - started >= TRANSIENT_MIN_MS);
-    if (p.status === "opening" && cur && allowSwitch) { p.status = "open"; p.opened = true; p.lastOpenedAt = p.lastOpenedAt || new Date().toISOString(); transitionAt.delete(p.id); }
-    else if (p.status === "closing" && !cur && allowSwitch) { p.status = "closed"; p.opened = false; transitionAt.delete(p.id); }
-    else if (p.status !== "opening" && p.status !== "closing") { p.status = cur ? "open" : "closed"; p.opened = cur; }
+    let pid = null;
+
+    try {
+      pid = await invoke<number | null>("browser_running", { label: p.id });
+      if (typeof pid === 'number' && pid > 0) {
+        (p as any).pid = pid;
+        cur = true;
+      }
+    } catch {}
+
+    if (!cur) {
+      try { cur = await isWindowOpen(p.id); } catch {}
+    }
+
+    return { profile: p, isRunning: cur, pid };
+  });
+
+  const results = await Promise.allSettled(statusPromises);
+
+  for (const result of results) {
+    if (result.status === 'fulfilled') {
+      const { profile: p, isRunning: cur } = result.value;
+      const started = transitionAt.get(p.id) || 0;
+      const allowSwitch = !started || (Date.now() - started >= TRANSIENT_MIN_MS);
+
+      if (p.status === "opening" && cur && allowSwitch) {
+        p.status = "open";
+        p.opened = true;
+        p.lastOpenedAt = p.lastOpenedAt || new Date().toISOString();
+        transitionAt.delete(p.id);
+      }
+      else if (p.status === "closing" && !cur && allowSwitch) {
+        p.status = "closed";
+        p.opened = false;
+        transitionAt.delete(p.id);
+      }
+      else if (p.status !== "opening" && p.status !== "closing") {
+        p.status = cur ? "open" : "closed";
+        p.opened = cur;
+      }
+    }
   }
+
   save();
 }
 onMounted(() => { load(); refreshStatusesOnce(); timer = window.setInterval(async () => { await refreshStatusesOnce(); }, 1000); });
@@ -252,7 +307,14 @@ async function bulkOpen() {
       // 启动高频轮询
       startFastPolling(p.id);
       await invoke("log_info", { message: `[BrowserList] bulk open label=${p.id} version=${p.engineVersion || 'N/A'}` });
-      const pid = await invoke<number | null>("browser_open", { label: p.id, url: null, version: p.engineVersion || null });
+      const displayTitle = `${p.name} - Libre Browser`;
+      const pid = await invoke<number | null>("browser_open", {
+        label: p.id,
+        url: null,
+        version: p.engineVersion || null,
+        windowTitle: displayTitle,
+        browser_name: p.name
+      });
       if (pid && typeof pid === 'number') { (p as any).pid = pid; }
       // 交由轮询切换到 open
     } catch {}
@@ -294,9 +356,21 @@ const isDark = computed(() => resolveEffectiveTheme() === "dark");
 
 async function onCreate(payload: any) {
   const id = `CHE-${Date.now().toString().slice(-6)}`;
+  const displayName = payload.name || id;
   try { await invoke("browser_close", { label: id }); } catch {}
   let engineVersion: string | undefined; try { const v = localStorage.getItem("libre_default_engine"); if (v) engineVersion = v; } catch {}
-  state.profiles.push({ id, name: payload.name || id, project: payload.project || "默认项目", opened: false, fingerprint: JSON.stringify(payload.fingerprint), proxy: payload.proxy || "", status: "closed", engineVersion });
+  state.profiles.push({
+    id,
+    name: displayName,
+    project: payload.project || "默认项目",
+    opened: false,
+    fingerprint: JSON.stringify(payload.fingerprint),
+    proxy: payload.proxy || "",
+    status: "closed",
+    engineVersion,
+    // 添加窗口标题字段，格式：名称 - Libre Browser
+    windowTitle: `${displayName} - Libre Browser`
+  });
   save();
 }
 </script>
@@ -325,24 +399,31 @@ async function onCreate(payload: any) {
       </div>
     </div>
     <div class="px-4 py-3 @container">
-      <AppTable :isEmpty="filtered.length === 0" :cols="6">
+      <AppTable :isEmpty="filtered.length === 0" :cols="7">
         <template #head>
           <tr :class="isDark ? 'bg-[#192633]' : 'bg-slate-50'">
-            <th class="px-4 py-3 text-center w-[120px] text-sm font-medium leading-normal" :class="isDark ? 'text-white' : 'text-[#0d141b]'"><input type="checkbox" :class="['h-5 w-5 rounded border-2 bg-transparent focus:ring-0 focus:ring-offset-0 focus:outline-none', isDark ? 'border-[#324d67] text-[#1172d4] checked:bg-[#1172d4] checked:border-[#1172d4] focus:border-[#324d67]' : 'border-[#cfdbe7] text-[#2b8dee] checked:bg-[#2b8dee] checked:border-[#2b8dee] focus:border-[#cfdbe7]']" :checked="allSelected" @change="toggleAll" /></th>
-            <th class="px-4 py-3 text-left w-[400px] text-sm font-medium leading-normal" :class="isDark ? 'text-white' : 'text-[#0d141b]'">名称</th>
-            <th class="px-4 py-3 text-left w-[200px] text-sm font-medium leading-normal" :class="isDark ? 'text-white' : 'text-[#0d141b]'">内核版本</th>
-            <th class="px-4 py-3 text-left w-[400px] text-sm font-medium leading-normal" :class="isDark ? 'text-white' : 'text-[#0d141b]'">代理</th>
-            <th class="px-4 py-3 text-left w-[160px] text-sm font-medium leading-normal" :class="isDark ? 'text-white' : 'text-[#0d141b]'">状态</th>
+            <th class="px-4 py-3 text-center w-[80px] text-sm font-medium leading-normal" :class="isDark ? 'text-white' : 'text-[#0d141b]'"><input type="checkbox" :class="['h-5 w-5 rounded border-2 bg-transparent focus:ring-0 focus:ring-offset-0 focus:outline-none', isDark ? 'border-[#324d67] text-[#1172d4] checked:bg-[#1172d4] checked:border-[#1172d4] focus:border-[#324d67]' : 'border-[#cfdbe7] text-[#2b8dee] checked:bg-[#2b8dee] checked:border-[#2b8dee] focus:border-[#cfdbe7]']" :checked="allSelected" @change="toggleAll" /></th>
+            <th class="px-4 py-3 text-left w-[200px] text-sm font-medium leading-normal" :class="isDark ? 'text-white' : 'text-[#0d141b]'">ID</th>
+            <th class="px-4 py-3 text-left w-[300px] text-sm font-medium leading-normal" :class="isDark ? 'text-white' : 'text-[#0d141b]'">名称</th>
+            <th class="px-4 py-3 text-left w-[180px] text-sm font-medium leading-normal" :class="isDark ? 'text-white' : 'text-[#0d141b]'">内核版本</th>
+            <th class="px-4 py-3 text-left w-[300px] text-sm font-medium leading-normal" :class="isDark ? 'text-white' : 'text-[#0d141b]'">代理</th>
+            <th class="px-4 py-3 text-left w-[140px] text-sm font-medium leading-normal" :class="isDark ? 'text-white' : 'text-[#0d141b]'">状态</th>
             <th class="px-4 py-3 text-left w-60 text-sm font-medium leading-normal" :class="isDark ? 'text-[#92adc9]' : 'text-[#4c739a]'">操作</th>
           </tr>
         </template>
         <template #body>
           <tr v-for="p in filtered" :key="p.id" :class="['border-t', isDark ? 'border-t-[#324d67]' : 'border-t-[#cfdbe7]']">
-            <td class="h-[72px] px-4 py-2 w-[120px] text-center text-sm font-normal leading-normal"><input type="checkbox" :class="['h-5 w-5 rounded border-2 bg-transparent focus:ring-0 focus:ring-offset-0 focus:outline-none', isDark ? 'border-[#324d67] text-[#1172d4] checked:bg-[#1172d4] checked:border-[#1172d4] focus:border-[#324d67]' : 'border-[#cfdbe7] text-[#2b8dee] checked:bg-[#2b8dee] checked:border-[#2b8dee] focus:border-[#cfdbe7]']" :checked="selected.has(p.id)" @change="toggleRow(p.id)" /></td>
-            <td class="h-[72px] px-4 py-2 w-[400px] text-sm font-normal leading-normal" :class="isDark ? 'text-white' : 'text-[#0d141b]'">{{ p.name }}</td>
-            <td class="h-[72px] px-4 py-2 w-[200px] text-sm font-normal leading-normal" :class="isDark ? 'text-[#92adc9]' : 'text-[#4c739a]'">{{ p.engineVersion || '-' }}</td>
-            <td class="h-[72px] px-4 py-2 w-[400px] text-sm font-normal leading-normal" :class="isDark ? 'text-[#92adc9]' : 'text-[#4c739a]'">{{ p.proxy || '未配置' }}</td>
-            <td class="h-[72px] px-4 py-2 w-[160px] text-sm font-normal leading-normal"><span :class="statusClass(p.status)">{{ statusLabel(p.status) }}</span></td>
+            <td class="h-[72px] px-4 py-2 w-[80px] text-center text-sm font-normal leading-normal"><input type="checkbox" :class="['h-5 w-5 rounded border-2 bg-transparent focus:ring-0 focus:ring-offset-0 focus:outline-none', isDark ? 'border-[#324d67] text-[#1172d4] checked:bg-[#1172d4] checked:border-[#1172d4] focus:border-[#324d67]' : 'border-[#cfdbe7] text-[#2b8dee] checked:bg-[#2b8dee] checked:border-[#2b8dee] focus:border-[#cfdbe7]']" :checked="selected.has(p.id)" @change="toggleRow(p.id)" /></td>
+            <td class="h-[72px] px-4 py-2 w-[200px] text-sm font-mono leading-normal" :class="isDark ? 'text-[#92adc9]' : 'text-[#4c739a]'">{{ p.id }}</td>
+            <td class="h-[72px] px-4 py-2 w-[300px] text-sm font-normal leading-normal" :class="isDark ? 'text-white' : 'text-[#0d141b]'">
+              <div class="flex flex-col">
+                <span class="font-medium">{{ p.name }}</span>
+                <span class="text-xs" :class="isDark ? 'text-[#92adc9]' : 'text-[#4c739a]'">{{ p.windowTitle || `${p.name} - Libre Browser` }}</span>
+              </div>
+            </td>
+            <td class="h-[72px] px-4 py-2 w-[180px] text-sm font-normal leading-normal" :class="isDark ? 'text-[#92adc9]' : 'text-[#4c739a]'">{{ p.engineVersion || '-' }}</td>
+            <td class="h-[72px] px-4 py-2 w-[300px] text-sm font-normal leading-normal" :class="isDark ? 'text-[#92adc9]' : 'text-[#4c739a]'">{{ p.proxy || '未配置' }}</td>
+            <td class="h-[72px] px-4 py-2 w-[140px] text-sm font-normal leading-normal"><span :class="statusClass(p.status)">{{ statusLabel(p.status) }}</span></td>
             <td class="h-[72px] px-4 py-2 w-60 text-sm font-bold leading-normal tracking-[0.015em] whitespace-nowrap" :class="isDark ? 'text-[#92adc9]' : 'text-[#4c739a]'"><button class="mr-3" :class="isDark ? 'text-white' : 'text-[#0d141b]'" @click="toggleOpen(p)">{{ p.opened ? '关闭' : '启动' }}</button><button class="mr-3" :class="isDark ? 'text-white' : 'text-[#0d141b]'" @click="edit(p)">编辑</button><button :class="isDark ? 'text-white' : 'text-[#0d141b]'" @click="removeOne(p)">删除</button></td>
           </tr>
         </template>

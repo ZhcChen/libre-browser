@@ -7,12 +7,22 @@ use std::{env, fs::{self, File}, io::{Read, Write, Seek, SeekFrom}, path::{Path,
 use std::os::unix::fs::PermissionsExt;
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
  
+use image::{ImageBuffer, Rgba};
+use sha2::{Sha256, Digest};
+
 use std::collections::HashMap;
 use std::process::{Command, Stdio, Child};
 use std::{thread, time::Duration};
+use serde::{Deserialize, Serialize};
 
 static LOG_FILE: OnceCell<std::sync::Mutex<File>> = OnceCell::new();
 static PROC_MAP: OnceCell<std::sync::Mutex<HashMap<String, Child>>> = OnceCell::new();
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EngineInfo {
+    pub version: String,
+    pub installed_at: String,
+}
 
 fn logs_dir_path() -> PathBuf {
     // 优先使用系统推荐目录；失败则回退到 $HOME/.libre-browser/logs
@@ -75,6 +85,38 @@ fn engines_dir_path() -> PathBuf {
     base.push(".libre-browser");
     base.push("engines");
     base
+}
+
+fn engine_metadata_path() -> PathBuf {
+    let mut path = engines_dir_path();
+    path.push("metadata.json");
+    path
+}
+
+fn load_engine_metadata() -> HashMap<String, String> {
+    let path = engine_metadata_path();
+    if let Ok(mut f) = File::open(&path) {
+        let mut content = String::new();
+        if f.read_to_string(&mut content).is_ok() {
+            if let Ok(metadata) = serde_json::from_str::<HashMap<String, String>>(&content) {
+                return metadata;
+            }
+        }
+    }
+    HashMap::new()
+}
+
+fn save_engine_installation_time(version: &str) {
+    let mut metadata = load_engine_metadata();
+    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    metadata.insert(version.to_string(), timestamp);
+
+    let path = engine_metadata_path();
+    if let Ok(mut f) = File::create(&path) {
+        let json = serde_json::to_string_pretty(&metadata).unwrap_or_default();
+        let _ = f.write_all(json.as_bytes());
+        write_log("INFO", &format!("Recorded installation time for version {}: {}", version, timestamp));
+    }
 }
 
 fn data_local_base() -> PathBuf {
@@ -151,19 +193,75 @@ fn log_info(message: &str) { write_log("INFO", message); }
 fn engines_dir() -> String { engines_dir_path().to_string_lossy().to_string() }
 
 #[tauri::command]
-fn list_installed_engines() -> Vec<String> {
+fn list_installed_engines() -> Vec<EngineInfo> {
     let mut out = Vec::new();
     let root = engines_dir_path();
+    let metadata = load_engine_metadata();
+
     if let Ok(entries) = fs::read_dir(&root) {
-        for e in entries.flatten() {
-            if let Ok(md) = e.metadata() { if md.is_dir() {
-                if let Some(name) = e.file_name().to_str() {
-                    if is_probably_version(name) { out.push(name.to_string()); }
+        let mut dirs: Vec<_> = entries.flatten()
+            .filter_map(|e| {
+                let path = e.path();
+                if path.is_dir() && path.file_name().and_then(|n| n.to_str()).map(is_probably_version).unwrap_or(false) {
+                    Some(path)
+                } else {
+                    None
                 }
-            }}
+            })
+            .collect();
+
+        // 按版本号降序排序（最新版本靠前）
+        dirs.sort_by(|a, b| {
+            let a_version = a.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let b_version = b.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            cmp_version_desc(b_version, a_version)
+        });
+
+        for dir in dirs {
+            if let Some(version) = dir.file_name().and_then(|n| n.to_str()) {
+                let installed_at = metadata.get(version).cloned().unwrap_or_else(|| {
+                    // 如果没有记录安装时间，使用文件夹的修改时间
+                    if let Ok(md) = dir.metadata() {
+                        if let Ok(modified) = md.modified() {
+                            modified.duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| {
+                                    let dt = chrono::DateTime::from_timestamp(d.as_secs() as i64, 0)
+                                        .unwrap_or_default();
+                                    dt.format("%Y-%m-%d %H:%M:%S").to_string()
+                                })
+                                .unwrap_or_else(|_| "未知".to_string())
+                        } else {
+                            "未知".to_string()
+                        }
+                    } else {
+                        "未知".to_string()
+                    }
+                });
+
+                out.push(EngineInfo {
+                    version: version.to_string(),
+                    installed_at,
+                });
+            }
         }
     }
     out
+}
+
+// 版本比较函数，降序排序（新版本在前）
+fn cmp_version_desc(a: &str, b: &str) -> std::cmp::Ordering {
+    let pa: Vec<u32> = a.split('.').filter_map(|s| s.parse().ok()).collect();
+    let pb: Vec<u32> = b.split('.').filter_map(|s| s.parse().ok()).collect();
+
+    for i in 0..std::cmp::max(pa.len(), pb.len()) {
+        let va = pa.get(i).unwrap_or(&0);
+        let vb = pb.get(i).unwrap_or(&0);
+        match va.cmp(vb) {
+            std::cmp::Ordering::Equal => continue,
+            cmp => return cmp,
+        }
+    }
+    std::cmp::Ordering::Equal
 }
 
 fn find_engine_binary() -> Option<PathBuf> {
@@ -265,6 +363,10 @@ fn extract_engine_archive(version: &str) -> Result<String, String> {
     // 修复 macOS 执行权限并清除隔离属性（若存在）
     fix_macos_exec_and_quarantine(&dest_dir);
     let _ = fs::remove_file(&zip_path);
+
+    // 记录安装时间
+    save_engine_installation_time(version);
+
     write_log("INFO", &format!("extract_engine_archive ok -> {}", dest_dir.to_string_lossy()));
     Ok(dest_dir.to_string_lossy().to_string())
 }
@@ -277,6 +379,246 @@ fn path_contains_macos_exec_dir(p: &Path) -> bool {
         if seen_contents && s == "MacOS" { return true; }
     }
     false
+}
+
+// 图标生成相关函数
+fn custom_icons_dir() -> PathBuf {
+    let mut base = data_local_base();
+    base.push("custom_icons");
+    base
+}
+
+fn generate_browser_icon(name: &str, index: usize) -> Result<PathBuf, String> {
+    write_log("INFO", &format!("generate_browser_icon name={} index={}", name, index));
+
+    let icons_dir = custom_icons_dir();
+    fs::create_dir_all(&icons_dir).map_err(|e| format!("create icons dir failed: {e}"))?;
+
+    // 生成基于名称和索引的一致性哈希颜色
+    let hasher_input = format!("{}-{}", name, index);
+    let mut hasher = Sha256::new();
+    hasher.update(hasher_input.as_bytes());
+    let hash = hasher.finalize();
+
+    // 从哈希值生成颜色
+    let r = (hash[0] as u32) % 156 + 100; // 100-255 确保颜色不会太暗
+    let g = (hash[1] as u32) % 156 + 100;
+    let b = (hash[2] as u32) % 156 + 100;
+
+    // 生成512x512的图标
+    let size = 512u32;
+    let mut img = ImageBuffer::new(size, size);
+
+    // 绘制背景圆形
+    let center_x = size / 2;
+    let center_y = size / 2;
+    let radius = size / 2 - 20;
+
+    for (x, y, pixel) in img.enumerate_pixels_mut() {
+        let dx = x as i32 - center_x as i32;
+        let dy = y as i32 - center_y as i32;
+        let distance = ((dx * dx + dy * dy) as f64).sqrt();
+
+        if distance <= radius as f64 {
+            // 在圆形内绘制
+            *pixel = Rgba([r as u8, g as u8, b as u8, 255]);
+        } else {
+            // 透明背景
+            *pixel = Rgba([0, 0, 0, 0]);
+        }
+    }
+
+    // 生成图标文件名
+    let icon_name = format!("icon_{}_{}.png", name.replace(&[' ', '-', '/', '\\', ':', '*', '?', '"', '<', '>', '|'][..], "_"), index);
+    let icon_path = icons_dir.join(icon_name);
+
+    // 保存图标
+    img.save(&icon_path).map_err(|e| format!("save icon failed: {e}"))?;
+
+    write_log("INFO", &format!("Generated icon: {}", icon_path.to_string_lossy()));
+    Ok(icon_path)
+}
+
+#[cfg(target_os = "macos")]
+fn create_custom_app_bundle(source_app: &Path, target_name: &str, icon_path: &Path) -> Result<PathBuf, String> {
+    write_log("INFO", &format!("create_custom_app_bundle source={:?} target={} icon={:?}", source_app, target_name, icon_path));
+
+    let base_dir = data_local_base();
+    let custom_apps_dir = base_dir.join("custom_apps");
+    fs::create_dir_all(&custom_apps_dir).map_err(|e| format!("create custom_apps dir failed: {e}"))?;
+
+    let target_app_path = custom_apps_dir.join(format!("{}.app", target_name));
+    if target_app_path.exists() {
+        fs::remove_dir_all(&target_app_path).map_err(|e| format!("remove existing app failed: {e}"))?;
+    }
+
+    // 复制原始app bundle
+    let output = Command::new("cp")
+        .arg("-R")
+        .arg(source_app)
+        .arg(&target_app_path)
+        .output()
+        .map_err(|e| format!("cp command failed: {e}"))?;
+
+    if !output.status.success() {
+        return Err(format!("cp failed: {}", String::from_utf8_lossy(&output.stderr)));
+    }
+
+    // 修改应用名称
+    let info_plist_path = target_app_path.join("Contents/Info.plist");
+    if info_plist_path.exists() {
+        let output = Command::new("plutil")
+            .args(["-replace", "CFBundleName", "-string", target_name])
+            .arg(&info_plist_path)
+            .output()
+            .map_err(|e| format!("plutil replace CFBundleName failed: {e}"))?;
+
+        if !output.status.success() {
+            write_log("WARN", &format!("plutil replace CFBundleName failed: {}", String::from_utf8_lossy(&output.stderr)));
+        }
+
+        let output = Command::new("plutil")
+            .args(["-replace", "CFBundleDisplayName", "-string", target_name])
+            .arg(&info_plist_path)
+            .output()
+            .map_err(|e| format!("plutil replace CFBundleDisplayName failed: {e}"))?;
+
+        if !output.status.success() {
+            write_log("WARN", &format!("plutil replace CFBundleDisplayName failed: {}", String::from_utf8_lossy(&output.stderr)));
+        }
+    }
+
+    // 替换图标 - 使用ICNS格式
+    let icon_resources_dir = target_app_path.join("Contents/Resources");
+    if icon_resources_dir.exists() {
+        // 删除现有图标文件
+        for entry in fs::read_dir(&icon_resources_dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if let Some(filename) = path.file_name() {
+                let filename_str = filename.to_string_lossy();
+                if filename_str.starts_with("AppIcon") || filename_str.contains(".icns") {
+                    let _ = fs::remove_file(&path);
+                }
+            }
+        }
+
+        // 将PNG转换为ICNS格式
+        let icns_icon_path = icon_resources_dir.join("AppIcon.icns");
+        match convert_png_to_icns(icon_path, &icns_icon_path) {
+            Ok(()) => {
+                write_log("INFO", &format!("Successfully converted PNG to ICNS: {}", icns_icon_path.to_string_lossy()));
+
+                // 更新图标引用为ICNS文件
+                let output = Command::new("plutil")
+                    .args(["-replace", "CFBundleIconFile", "-string", "AppIcon.icns"])
+                    .arg(&info_plist_path)
+                    .output()
+                    .map_err(|e| format!("plutil replace CFBundleIconFile failed: {e}"))?;
+
+                if !output.status.success() {
+                    write_log("WARN", &format!("plutil replace CFBundleIconFile failed: {}", String::from_utf8_lossy(&output.stderr)));
+                }
+            }
+            Err(e) => {
+                write_log("WARN", &format!("Failed to convert PNG to ICNS: {}, falling back to PNG", e));
+
+                // 回退到PNG格式
+                let target_icon_path = icon_resources_dir.join("AppIcon.png");
+                fs::copy(icon_path, &target_icon_path).map_err(|e| format!("copy icon failed: {e}"))?;
+
+                // 更新图标引用
+                let output = Command::new("plutil")
+                    .args(["-replace", "CFBundleIconFile", "-string", "AppIcon.png"])
+                    .arg(&info_plist_path)
+                    .output()
+                    .map_err(|e| format!("plutil replace CFBundleIconFile failed: {e}"))?;
+
+                if !output.status.success() {
+                    write_log("WARN", &format!("plutil replace CFBundleIconFile failed: {}", String::from_utf8_lossy(&output.stderr)));
+                }
+            }
+        }
+    }
+
+    write_log("INFO", &format!("Created custom app bundle: {}", target_app_path.to_string_lossy()));
+    Ok(target_app_path)
+}
+
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+fn refresh_icon_cache(app_path: &Path) -> Result<(), String> {
+    write_log("INFO", &format!("Refreshing icon cache for: {}", app_path.to_string_lossy()));
+
+    // 方法1: 使用touch命令修改应用bundle的修改时间
+    let output = Command::new("touch")
+        .arg(app_path)
+        .output()
+        .map_err(|e| format!("touch command failed: {e}"))?;
+
+    if !output.status.success() {
+        write_log("WARN", &format!("touch failed: {}", String::from_utf8_lossy(&output.stderr)));
+    }
+
+    // 方法2: 清理系统图标缓存（可能需要管理员权限，所以我们只记录警告）
+    let output = Command::new("sudo")
+        .args(["find", "/private/var/folders/", "-name", "com.apple.iconservices", "-exec", "rm", "-rf", "{}", ";"])
+        .output();
+
+    match output {
+        Ok(_) => write_log("INFO", "Successfully cleared icon cache"),
+        Err(e) => write_log("WARN", &format!("Failed to clear icon cache (this is normal without sudo): {}", e)),
+    }
+
+    // 方法3: 重启Dock相关服务
+    let output = Command::new("killall")
+        .args(["Dock"])
+        .output();
+
+    match output {
+        Ok(_) => write_log("INFO", "Successfully restarted Dock"),
+        Err(e) => write_log("WARN", &format!("Failed to restart Dock: {}", e)),
+    }
+
+    // 方法4: 使用系统工具注册应用
+    let output = Command::new("open")
+        .arg("-R")
+        .arg(app_path)
+        .output();
+
+    match output {
+        Ok(_) => write_log("INFO", "Successfully revealed app in Finder"),
+        Err(e) => write_log("WARN", &format!("Failed to reveal app in Finder: {}", e)),
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn convert_png_to_icns(png_path: &Path, icns_path: &Path) -> Result<(), String> {
+    write_log("INFO", &format!("Converting PNG to ICNS: {} -> {}", png_path.to_string_lossy(), icns_path.to_string_lossy()));
+
+    // 使用macOS的sips工具将PNG转换为ICNS
+    let output = Command::new("sips")
+        .args(["-s", "format", "icns", png_path.to_string_lossy().as_ref(), "--out", icns_path.to_string_lossy().as_ref()])
+        .output()
+        .map_err(|e| format!("sips command failed: {e}"))?;
+
+    if !output.status.success() {
+        return Err(format!("sips failed: {}", String::from_utf8_lossy(&output.stderr)));
+    }
+
+    // 检查输出文件是否存在
+    if !icns_path.exists() {
+        return Err("ICNS file was not created".into());
+    }
+
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn create_custom_app_bundle(_source_app: &Path, _target_name: &str, _icon_path: &Path) -> Result<PathBuf, String> {
+    Err("Custom app bundles are only supported on macOS".into())
 }
 
 fn find_engine_binary_for_version(version: &str) -> Option<PathBuf> {
@@ -347,9 +689,12 @@ fn fix_macos_exec_and_quarantine(root: &PathBuf) {
 fn fix_macos_exec_and_quarantine(_root: &PathBuf) {}
 
 #[tauri::command]
-fn browser_open(app: AppHandle, label: &str, url: Option<&str>, version: Option<&str>) -> Result<Option<u32>, String> {
+fn browser_open(app: AppHandle, label: &str, url: Option<&str>, version: Option<&str>, window_title: Option<&str>, browser_name: Option<&str>) -> Result<Option<u32>, String> {
     let lbl = format!("browser-{}", label);
-    write_log("INFO", &format!("browser_open label={} version={:?} url={:?}", label, version, url));
+    let default_title = format!("Libre Browser - {}", label);
+    let display_title = window_title.unwrap_or(&default_title);
+    let display_name = browser_name.unwrap_or(label);
+    write_log("INFO", &format!("browser_open label={} version={:?} url={:?} title={:?} name={:?}", label, version, url, display_title, display_name));
     // If we already spawned a process for this label and it's running, do nothing
     if let Ok(mut m) = proc_map().lock() {
         if let Some(child) = m.get_mut(label) {
@@ -364,6 +709,55 @@ fn browser_open(app: AppHandle, label: &str, url: Option<&str>, version: Option<
     let engine_bin = if let Some(v) = version { find_engine_binary_for_version(v) } else { find_engine_binary() };
     if engine_bin.is_none() { write_log("WARN", &format!("no engine binary found for version={:?}; fallback to webview", version)); }
     if let Some(bin) = engine_bin {
+        // 生成自定义图标和App Bundle（仅在macOS上）
+        let (custom_app, app_dir) = if cfg!(target_os = "macos") {
+            // 生成唯一索引，基于标签哈希
+            let mut hasher = Sha256::new();
+            hasher.update(label.as_bytes());
+            let hash = hasher.finalize();
+            let icon_index = (hash[0] as usize) % 1000; // 0-999的索引
+
+            match generate_browser_icon(&display_name, icon_index) {
+                Ok(icon_path) => {
+                    // 创建自定义App Bundle
+                    match bin.parent().and_then(|p| p.parent()).and_then(|p| p.parent()) {
+                        Some(source_app) => {
+                            match create_custom_app_bundle(&source_app, &display_name, &icon_path) {
+                                Ok(custom_app) => {
+                                    // 获取自定义app目录
+                                    let app_dir = custom_app.parent().map(|p| p.to_path_buf());
+                                    match app_dir {
+                                        Some(custom_app_dir) => {
+                                            write_log("INFO", &format!("Using custom app bundle: {:?}", custom_app));
+                                            (Some(custom_app), Some(custom_app_dir))
+                                        }
+                                        None => {
+                                            write_log("WARN", "无法获取自定义app目录");
+                                            (Some(custom_app), bin.parent().and_then(|p| p.parent()).and_then(|p| p.parent()).map(|p| p.to_path_buf()))
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    write_log("WARN", &format!("Failed to create custom app bundle: {}, using original", e));
+                                    (None, bin.parent().and_then(|p| p.parent()).and_then(|p| p.parent()).map(|p| p.to_path_buf()))
+                                }
+                            }
+                        }
+                        None => {
+                            write_log("WARN", "无法找到源app目录");
+                            (None, bin.parent().and_then(|p| p.parent()).and_then(|p| p.parent()).map(|p| p.to_path_buf()))
+                        }
+                    }
+                }
+                Err(e) => {
+                    write_log("WARN", &format!("Failed to generate icon: {}, using original", e));
+                    (None, bin.parent().and_then(|p| p.parent()).and_then(|p| p.parent()).map(|p| p.to_path_buf()))
+                }
+            }
+        } else {
+            (None, bin.parent().and_then(|p| p.parent()).and_then(|p| p.parent()).map(|p| p.to_path_buf()))
+        };
+
         // Best-effort: fix permissions/quarantine for existing installs before spawn
         #[cfg(target_os = "macos")]
         {
@@ -371,7 +765,7 @@ fn browser_open(app: AppHandle, label: &str, url: Option<&str>, version: Option<
                 let mut verdir = engines_dir_path();
                 verdir.push(v);
                 fix_macos_exec_and_quarantine(&verdir);
-            } else if let Some(app_dir) = bin.parent().and_then(|p| p.parent()).and_then(|p| p.parent()) {
+            } else if let Some(ref app_dir) = app_dir {
                 fix_macos_exec_and_quarantine(&app_dir.to_path_buf());
             }
         }
@@ -396,6 +790,8 @@ fn browser_open(app: AppHandle, label: &str, url: Option<&str>, version: Option<
         // 减少提示条
         args.push("--test-type".into());
         args.push("--disable-infobars".into());
+        // 设置窗口标题（Chromium 支持）
+        args.push(format!("--window-name={}", display_title));
         // 打开 Chromium 日志
         args.push("--enable-logging=1".into());
         args.push("--v=1".into());
@@ -403,69 +799,76 @@ fn browser_open(app: AppHandle, label: &str, url: Option<&str>, version: Option<
         args.push(format!("--crash-dumps-dir={}", crash_dir.to_string_lossy()));
         #[cfg(target_os = "macos")]
         {
-            // 优先通过 open 打开 .app，避免 GUI 激活问题
-            if let Some(app_dir) = bin.parent().and_then(|p| p.parent()).and_then(|p| p.parent()) {
-                write_log("INFO", &format!("open app {:?} with args={:?}", app_dir, args));
-                let status = Command::new("open").arg("-n").arg(app_dir).arg("--args").args(&args).status();
-                match status {
-                    Ok(st) if st.success() => {
-                        // 轮询查找 PID
-                        let pid = try_find_pid_by_profile(&profile_dir, 3000);
-                        if let Some(pid) = pid {
-                            write_log("INFO", &format!("open ok pid={}", pid));
-                            // 先写入 pid 文件与监控，避免后续激活卡住影响前端状态
-                            let pid_file = profile_dir_path(label).join("pid");
-                            match File::create(&pid_file) {
-                                Ok(mut f) => { let _ = write!(f, "{}", pid); let _ = f.flush(); write_log("INFO", &format!("wrote pid file {}", pid_file.to_string_lossy())); }
-                                Err(e) => { write_log("ERROR", &format!("create pid file {} failed: {}", pid_file.to_string_lossy(), e)); }
-                            }
-                            // 监控进程早退，采集 Chromium 日志
-                            let lbl = label.to_string(); let pdir = profile_dir.clone();
-                            thread::spawn(move || {
-                                let start = std::time::Instant::now();
-                                loop {
-                                    if !pid_alive_unix(pid) {
-                                        let ms = start.elapsed().as_millis();
-                                        if ms < 5000 { // 5s 内退出认为异常
-                                            write_log("ERROR", &format!("engine pid={} exited quickly ({}ms)", pid, ms));
-                                            let logp = pdir.join("chrome_debug.log");
-                                            if let Some(tail) = tail_file_lines(&logp, 100, 64*1024) {
-                                                for line in tail.lines() { write_log("ERROR", &format!("[ChromeLog][{}] {}", lbl, line)); }
-                                            } else {
-                                                write_log("WARN", &format!("no chrome_debug.log for {}", lbl));
-                                            }
-                                        }
-                                        break;
-                                    }
-                                    thread::sleep(Duration::from_millis(200));
-                                }
-                            });
-                            // 尝试前置激活窗口（异步，不阻塞主流程）
-                            if let Some(app_name_os) = app_dir.file_name() {
-                                let mut app_name = app_name_os.to_string_lossy().to_string();
-                                if let Some(stripped) = app_name.strip_suffix(".app") { app_name = stripped.to_string(); }
-                                match Command::new("osascript").args(["-e", &format!("tell application \"{}\" to activate", app_name)]).spawn() {
-                                    Ok(_) => write_log("INFO", &format!("osascript activate spawned for {}", app_name)),
-                                    Err(e) => {
-                                        write_log("ERROR", &format!("osascript spawn error: {} — fallback to direct spawn", e));
-                                        let _ = Command::new(&bin)
-                                            .args(&args)
-                                            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
-                                            .status()
-                                            .map(|s| write_log("INFO", &format!("fallback direct spawn status={}", s)))
-                                            .map_err(|e| write_log("ERROR", &format!("fallback direct spawn error: {}", e)));
-                                    }
-                                }
-                            }
-                            return Ok(Some(pid));
-                        } else {
-                            write_log("WARN", "open succeeded but pid not found within timeout");
-                            return Ok(None);
+            // 优先通过 open 打开自定义或原始 .app，避免 GUI 激活问题
+            let app_to_use = if let Some(ref custom_app) = custom_app.as_ref() {
+                custom_app
+            } else if let Some(app_dir) = bin.parent().and_then(|p| p.parent()).and_then(|p| p.parent()) {
+                app_dir
+            } else {
+                write_log("ERROR", "无法找到应用目录");
+                return Err("无法找到应用目录".into());
+            };
+
+            write_log("INFO", &format!("open app {:?} with args={:?}", app_to_use, args));
+            let status = Command::new("open").arg("-n").arg(app_to_use).arg("--args").args(&args).status();
+            match status {
+                Ok(st) if st.success() => {
+                    // 轮询查找 PID
+                    let pid = try_find_pid_by_profile(&profile_dir, 3000);
+                    if let Some(pid) = pid {
+                        write_log("INFO", &format!("open ok pid={}", pid));
+                        // 先写入 pid 文件与监控，避免后续激活卡住影响前端状态
+                        let pid_file = profile_dir_path(label).join("pid");
+                        match File::create(&pid_file) {
+                            Ok(mut f) => { let _ = write!(f, "{}", pid); let _ = f.flush(); write_log("INFO", &format!("wrote pid file {}", pid_file.to_string_lossy())); }
+                            Err(e) => { write_log("ERROR", &format!("create pid file {} failed: {}", pid_file.to_string_lossy(), e)); }
                         }
+                        // 监控进程早退，采集 Chromium 日志
+                        let lbl = label.to_string(); let pdir = profile_dir.clone();
+                        thread::spawn(move || {
+                            let start = std::time::Instant::now();
+                            loop {
+                                if !pid_alive_unix(pid) {
+                                    let ms = start.elapsed().as_millis();
+                                    if ms < 5000 { // 5s 内退出认为异常
+                                        write_log("ERROR", &format!("engine pid={} exited quickly ({}ms)", pid, ms));
+                                        let logp = pdir.join("chrome_debug.log");
+                                        if let Some(tail) = tail_file_lines(&logp, 100, 64*1024) {
+                                            for line in tail.lines() { write_log("ERROR", &format!("[ChromeLog][{}] {}", lbl, line)); }
+                                        } else {
+                                            write_log("WARN", &format!("no chrome_debug.log for {}", lbl));
+                                        }
+                                    }
+                                    break;
+                                }
+                                thread::sleep(Duration::from_millis(200));
+                            }
+                        });
+                        // 尝试前置激活窗口（异步，不阻塞主流程）
+                        if let Some(app_name_os) = app_to_use.file_name() {
+                            let mut app_name = app_name_os.to_string_lossy().to_string();
+                            if let Some(stripped) = app_name.strip_suffix(".app") { app_name = stripped.to_string(); }
+                            match Command::new("osascript").args(["-e", &format!("tell application \"{}\" to activate", app_name)]).spawn() {
+                                Ok(_) => write_log("INFO", &format!("osascript activate spawned for {}", app_name)),
+                                Err(e) => {
+                                    write_log("ERROR", &format!("osascript spawn error: {} — fallback to direct spawn", e));
+                                    let _ = Command::new(&bin)
+                                        .args(&args)
+                                        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+                                        .status()
+                                        .map(|s| write_log("INFO", &format!("fallback direct spawn status={}", s)))
+                                        .map_err(|e| write_log("ERROR", &format!("fallback direct spawn error: {}", e)));
+                                }
+                            }
+                        }
+                        return Ok(Some(pid));
+                    } else {
+                        write_log("WARN", "open succeeded but pid not found within timeout");
+                        return Ok(None);
                     }
-                    Ok(st) => { write_log("ERROR", &format!("open returned status {}", st)); }
-                    Err(e) => { write_log("ERROR", &format!("open failed: {}", e)); }
                 }
+                Ok(st) => { write_log("ERROR", &format!("open returned status {}", st)); }
+                Err(e) => { write_log("ERROR", &format!("open failed: {}", e)); }
             }
         }
         // 非 macOS 或回退：直接执行二进制
@@ -633,7 +1036,10 @@ fn read_logs_tail(lines: usize) -> Result<String, String> {
     Ok(v[v.len()-n..].join("\n"))
 }
 
- 
+#[cfg(test)]
+mod test_icon;
+
+
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {

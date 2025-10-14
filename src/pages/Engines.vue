@@ -9,7 +9,7 @@ import { fetch as httpFetch } from "@tauri-apps/plugin-http";
 import { invoke } from "@tauri-apps/api/core";
 // opener not needed for Rust-handled downloads
 
-type Engine = { name: string; version: string; date?: string; size?: string; installed?: boolean; default?: boolean; downloadUrl?: string };
+type Engine = { name: string; version: string; date?: string; size?: string; installed?: boolean; default?: boolean; downloadUrl?: string; installedAt?: string };
 
 const installed = ref<Engine[]>([]);
 
@@ -239,10 +239,18 @@ function setExtracting(ver: string, val: boolean) {
 }
 async function refreshInstalled() {
   try {
-    const list = await invoke<string[]>("list_installed_engines");
-    installedVersions.value = list;
-    installedSet.value = new Set(list);
-    installed.value = list.map(v => ({ name: "Chrome", version: v, date: "-", size: "-", installed: true, default: v === defaultVersion.value }));
+    const list = await invoke<any[]>("list_installed_engines");
+    installedVersions.value = list.map(item => item.version);
+    installedSet.value = new Set(installedVersions.value);
+    installed.value = list.map(item => ({
+      name: "Chrome",
+      version: item.version,
+      date: "-",
+      size: "-",
+      installed: true,
+      default: item.version === defaultVersion.value,
+      installedAt: item.installedAt
+    }));
   } catch {}
 }
 async function downloadEngine(e: Engine) {
@@ -285,21 +293,23 @@ function toggleDefault(e: Engine, checked: boolean) {
     <template v-if="activeTab === 'installed'">
       <h2 class="text-[22px] font-bold leading-tight tracking-[-0.015em] px-4 pb-3 pt-5" :class="isDark ? 'text-white' : 'text-[#0d141b]'">已安装的内核</h2>
       <div class="px-4 py-3 @container">
-        <AppTable :isEmpty="installed.length === 0" :cols="5">
+        <AppTable :isEmpty="installed.length === 0" :cols="6">
           <template #head>
             <tr :class="isDark ? 'bg-[#192633]' : 'bg-slate-50'">
-              <th class="px-4 py-3 text-left w-[400px] text-sm font-medium leading-normal" :class="isDark ? 'text-white' : 'text-[#0d141b]'">名称/版本</th>
-              <th class="px-4 py-3 text-left w-[400px] text-sm font-medium leading-normal" :class="isDark ? 'text-white' : 'text-[#0d141b]'">发布日期</th>
-              <th class="px-4 py-3 text-left w-[400px] text-sm font-medium leading-normal" :class="isDark ? 'text-white' : 'text-[#0d141b]'">大小</th>
+              <th class="px-4 py-3 text-left w-[250px] text-sm font-medium leading-normal" :class="isDark ? 'text-white' : 'text-[#0d141b]'">版本</th>
+              <th class="px-4 py-3 text-left w-[200px] text-sm font-medium leading-normal" :class="isDark ? 'text-white' : 'text-[#0d141b]'">安装时间</th>
+              <th class="px-4 py-3 text-left w-[200px] text-sm font-medium leading-normal" :class="isDark ? 'text-white' : 'text-[#0d141b]'">发布日期</th>
+              <th class="px-4 py-3 text-left w-[150px] text-sm font-medium leading-normal" :class="isDark ? 'text-white' : 'text-[#0d141b]'">大小</th>
               <th class="px-4 py-3 text-center w-[120px] text-sm font-medium leading-normal" :class="isDark ? 'text-white' : 'text-[#0d141b]'">默认</th>
               <th class="px-4 py-3 text-left w-60 text-sm font-medium leading-normal" :class="isDark ? 'text-[#92adc9]' : 'text-[#4c739a]'">操作</th>
             </tr>
           </template>
           <template #body>
             <tr v-for="e in installed" :key="e.name+e.version" :class="['border-t', isDark ? 'border-t-[#324d67]' : 'border-t-[#cfdbe7]']">
-              <td class="h-[72px] px-4 py-2 w-[400px] text-sm font-normal leading-normal" :class="isDark ? 'text-white' : 'text-[#0d141b]'">{{ e.name }} {{ e.version }}</td>
-              <td class="h-[72px] px-4 py-2 w-[400px] text-sm font-normal leading-normal" :class="isDark ? 'text-[#92adc9]' : 'text-[#4c739a]'">{{ e.date }}</td>
-              <td class="h-[72px] px-4 py-2 w-[400px] text-sm font-normal leading-normal" :class="isDark ? 'text-[#92adc9]' : 'text-[#4c739a]'">{{ e.size }}</td>
+              <td class="h-[72px] px-4 py-2 w-[250px] text-sm font-normal leading-normal" :class="isDark ? 'text-white' : 'text-[#0d141b]'">{{ e.name }} {{ e.version }}</td>
+              <td class="h-[72px] px-4 py-2 w-[200px] text-sm font-normal leading-normal" :class="isDark ? 'text-[#92adc9]' : 'text-[#4c739a]'">{{ e.installedAt || '未知' }}</td>
+              <td class="h-[72px] px-4 py-2 w-[200px] text-sm font-normal leading-normal" :class="isDark ? 'text-[#92adc9]' : 'text-[#4c739a]'">{{ e.date }}</td>
+              <td class="h-[72px] px-4 py-2 w-[150px] text-sm font-normal leading-normal" :class="isDark ? 'text-[#92adc9]' : 'text-[#4c739a]'">{{ e.size }}</td>
               <td class="h-[72px] px-4 py-2 w-[120px] text-center text-sm font-normal leading-normal">
                 <input type="checkbox" :checked="e.default" @change="(ev:any)=> toggleDefault(e, ev.target?.checked)" :class="['h-5 w-5 rounded border-2 bg-transparent checked:bg-[image:--checkbox-tick-svg] focus:ring-0 focus:ring-offset-0 focus:outline-none mx-auto block', isDark ? 'border-[#324d67] text-[#1172d4] checked:bg-[#1172d4] checked:border-[#1172d4] focus:border-[#324d67]' : 'border-[#cfdbe7] text-[#2b8dee] checked:bg-[#2b8dee] checked:border-[#2b8dee] focus:border-[#cfdbe7]']" />
               </td>
