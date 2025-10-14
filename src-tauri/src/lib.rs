@@ -109,7 +109,7 @@ fn load_engine_metadata() -> HashMap<String, String> {
 fn save_engine_installation_time(version: &str) {
     let mut metadata = load_engine_metadata();
     let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    metadata.insert(version.to_string(), timestamp);
+    metadata.insert(version.to_string(), timestamp.clone());
 
     let path = engine_metadata_path();
     if let Ok(mut f) = File::create(&path) {
