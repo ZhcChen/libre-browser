@@ -1,5 +1,5 @@
 // 测试图标生成功能
-use crate::{generate_browser_icon, data_local_base};
+use crate::{data_local_base, generate_browser_icon};
 use std::path::Path;
 
 #[cfg(test)]
@@ -46,7 +46,10 @@ mod tests {
         // 尝试创建目录
         match std::fs::create_dir_all(&custom_apps_dir) {
             Ok(()) => {
-                println!("✓ 自定义应用目录创建成功: {}", custom_apps_dir.to_string_lossy());
+                println!(
+                    "✓ 自定义应用目录创建成功: {}",
+                    custom_apps_dir.to_string_lossy()
+                );
                 assert!(custom_apps_dir.exists(), "目录应该存在");
             }
             Err(e) => {
