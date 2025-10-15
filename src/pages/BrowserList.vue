@@ -3,6 +3,7 @@ import { reactive, ref, computed, onMounted, onBeforeUnmount } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { resolveEffectiveTheme } from "../state/settings";
 import BrowserCreateModal from "../components/BrowserCreateModal.vue";
+import BrowserBatchCreateModal from "../components/BrowserBatchCreateModal.vue";
 import AppTable from "../components/AppTable.vue";
 import Modal from "../components/Modal.vue";
 
@@ -148,7 +149,46 @@ function statusClass(s?: BrowserStatus) {
   }
 }
 const showCreate = ref(false);
+const showBatchCreate = ref(false);
 function createProfile() { showCreate.value = true; }
+function createProfilesInBatch() { showBatchCreate.value = true; }
+
+function generateProfileId() {
+  const ts = Date.now().toString(36).toUpperCase();
+  const rand = Math.floor(Math.random() * 1000)
+    .toString()
+    .padStart(3, "0");
+  return `CHE-${ts}-${rand}`;
+}
+
+async function appendProfiles(forms: any[]) {
+  if (!Array.isArray(forms) || forms.length === 0) return;
+  let defaultEngine: string | undefined;
+  try {
+    const v = localStorage.getItem("libre_default_engine");
+    if (v) defaultEngine = v;
+  } catch {}
+
+  const created: BrowserProfile[] = [];
+  for (const form of forms) {
+    const id = generateProfileId();
+    try { await invoke("browser_close", { label: id }); } catch {}
+    const displayName = (form?.name || "").trim() || id;
+    created.push({
+      id,
+      name: displayName,
+      project: form?.project || "默认项目",
+      opened: false,
+      fingerprint: JSON.stringify(form?.fingerprint ?? {}),
+      proxy: form?.proxy || "",
+      status: "closed",
+      engineVersion: form?.engineVersion || defaultEngine,
+      windowTitle: `${displayName} - Libre Browser`
+    });
+  }
+  state.profiles.push(...created);
+  save();
+}
 
 let timer: number | undefined;
 // 高频轮询管理：每个浏览器可以有自己的独立高频轮询
@@ -355,23 +395,11 @@ async function bulkClose() {
 const isDark = computed(() => resolveEffectiveTheme() === "dark");
 
 async function onCreate(payload: any) {
-  const id = `CHE-${Date.now().toString().slice(-6)}`;
-  const displayName = payload.name || id;
-  try { await invoke("browser_close", { label: id }); } catch {}
-  let engineVersion: string | undefined; try { const v = localStorage.getItem("libre_default_engine"); if (v) engineVersion = v; } catch {}
-  state.profiles.push({
-    id,
-    name: displayName,
-    project: payload.project || "默认项目",
-    opened: false,
-    fingerprint: JSON.stringify(payload.fingerprint),
-    proxy: payload.proxy || "",
-    status: "closed",
-    engineVersion,
-    // 添加窗口标题字段，格式：名称 - Libre Browser
-    windowTitle: `${displayName} - Libre Browser`
-  });
-  save();
+  await appendProfiles([payload]);
+}
+
+async function onBatchCreate(payloads: any[]) {
+  await appendProfiles(payloads);
 }
 </script>
 
@@ -379,7 +407,10 @@ async function onCreate(payload: any) {
   <div class="layout-content-container flex flex-col flex-1 min-w-[600px] shrink-0">
     <div class="flex flex-wrap justify-between gap-3 p-4">
       <p class="tracking-light text-[32px] font-bold leading-tight min-w-72" :class="isDark ? 'text-white' : 'text-[#0d141b]'">浏览器列表</p>
-      <button :class="['flex min-w-[84px] max-w-[480px] cursor-pointer items-center justify-center overflow-hidden rounded-lg h-8 px-4 text-sm font-medium leading-normal', isDark ? 'bg-[#233648] text-white' : 'bg-[#e7edf3] text-[#0d141b]']" @click="createProfile"><span class="truncate">新建浏览器</span></button>
+      <div class="flex flex-wrap gap-3">
+        <button :class="['flex min-w-[84px] max-w-[480px] cursor-pointer items-center justify-center overflow-hidden rounded-lg h-8 px-4 text-sm font-medium leading-normal', isDark ? 'bg-[#233648] text-white' : 'bg-[#e7edf3] text-[#0d141b]']" @click="createProfilesInBatch"><span class="truncate">批量新建浏览器</span></button>
+        <button :class="['flex min-w-[84px] max-w-[480px] cursor-pointer items-center justify-center overflow-hidden rounded-lg h-8 px-4 text-sm font-medium leading-normal', isDark ? 'bg-[#233648] text-white' : 'bg-[#e7edf3] text-[#0d141b]']" @click="createProfile"><span class="truncate">新建浏览器</span></button>
+      </div>
     </div>
     <div class="px-4 py-3">
       <label class="flex flex-col min-w-40 h-12 w-full">
@@ -416,10 +447,7 @@ async function onCreate(payload: any) {
             <td class="h-[72px] px-4 py-2 w-[80px] text-center text-sm font-normal leading-normal"><input type="checkbox" :class="['h-5 w-5 rounded border-2 bg-transparent focus:ring-0 focus:ring-offset-0 focus:outline-none', isDark ? 'border-[#324d67] text-[#1172d4] checked:bg-[#1172d4] checked:border-[#1172d4] focus:border-[#324d67]' : 'border-[#cfdbe7] text-[#2b8dee] checked:bg-[#2b8dee] checked:border-[#2b8dee] focus:border-[#cfdbe7]']" :checked="selected.has(p.id)" @change="toggleRow(p.id)" /></td>
             <td class="h-[72px] px-4 py-2 w-[200px] text-sm font-mono leading-normal" :class="isDark ? 'text-[#92adc9]' : 'text-[#4c739a]'">{{ p.id }}</td>
             <td class="h-[72px] px-4 py-2 w-[300px] text-sm font-normal leading-normal" :class="isDark ? 'text-white' : 'text-[#0d141b]'">
-              <div class="flex flex-col">
-                <span class="font-medium">{{ p.name }}</span>
-                <span class="text-xs" :class="isDark ? 'text-[#92adc9]' : 'text-[#4c739a]'">{{ p.windowTitle || `${p.name} - Libre Browser` }}</span>
-              </div>
+              <span class="font-medium">{{ p.name }}</span>
             </td>
             <td class="h-[72px] px-4 py-2 w-[180px] text-sm font-normal leading-normal" :class="isDark ? 'text-[#92adc9]' : 'text-[#4c739a]'">{{ p.engineVersion || '-' }}</td>
             <td class="h-[72px] px-4 py-2 w-[300px] text-sm font-normal leading-normal" :class="isDark ? 'text-[#92adc9]' : 'text-[#4c739a]'">{{ p.proxy || '未配置' }}</td>
@@ -431,6 +459,7 @@ async function onCreate(payload: any) {
     </div>
   </div>
   <BrowserCreateModal v-model="showCreate" @submit="onCreate" />
+  <BrowserBatchCreateModal v-model="showBatchCreate" @submit="onBatchCreate" />
   <Modal v-model="confirmVisible" :title="'确认删除'" :message="confirmMsg" :showCancel="true" confirmText="删除" cancelText="取消" @confirm="onConfirm" />
 </template>
 

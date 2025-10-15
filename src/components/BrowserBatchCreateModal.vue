@@ -2,18 +2,13 @@
 import { computed, reactive } from "vue";
 import { resolveEffectiveTheme } from "../state/settings";
 defineProps<{ modelValue: boolean }>();
-const emit = defineEmits<{ (e: 'update:modelValue', v: boolean): void; (e: 'submit', payload: any): void }>();
+const emit = defineEmits<{ (e: 'update:modelValue', v: boolean): void; (e: 'submit', payload: any[]): void }>();
 const isDark = computed(() => resolveEffectiveTheme() === 'dark');
 
-// 生成默认名称的函数
-function generateDefaultName(): string {
-  const timestamp = Date.now().toString().slice(-6);
-  const randomNum = Math.floor(Math.random() * 1000);
-  return `浏览器-${timestamp}-${randomNum}`;
-}
-
 const form = reactive({
-  name: '', project: '默认项目',
+  namePrefix: '', 
+  count: 5,
+  project: '默认项目',
   fingerprint: {
     userAgent: navigator.userAgent,
     timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
@@ -47,13 +42,33 @@ const form = reactive({
   },
   proxy: ''
 });
+
 function close(){ emit('update:modelValue', false); }
+
 function submit(){
-  // 如果名称为空，自动生成默认名称
-  if (!form.name.trim()) {
-    form.name = generateDefaultName();
+  // 验证输入
+  if (!form.namePrefix.trim()) {
+    alert('请输入名称前缀');
+    return;
   }
-  emit('submit', JSON.parse(JSON.stringify(form)));
+  if (form.count <= 0 || form.count > 100) {
+    alert('创建数量必须在1-100之间');
+    return;
+  }
+
+  // 生成批量创建的数据
+  const batchPayload: any[] = [];
+  for (let i = 1; i <= form.count; i++) {
+    const singleForm = JSON.parse(JSON.stringify(form));
+    // 生成名称：前缀-序号
+    singleForm.name = `${form.namePrefix}-${i}`;
+    // 移除批量创建特有的字段
+    delete singleForm.namePrefix;
+    delete singleForm.count;
+    batchPayload.push(singleForm);
+  }
+  
+  emit('submit', batchPayload);
   close();
 }
 </script>
@@ -62,15 +77,19 @@ function submit(){
   <div v-if="modelValue" class="fixed inset-0 z-50 flex items-center justify-center">
     <div class="absolute inset-0 bg-black/40" @click="close" />
     <div class="relative w-[720px] max-h-[80vh] flex flex-col rounded-lg p-4" :class="isDark ? 'bg-[#111a22] text-white' : 'bg-white text-[#0d141b]'">
-      <div class="text-lg font-bold mb-3">新建浏览器</div>
+      <div class="text-lg font-bold mb-3">批量新建浏览器</div>
       <div class="max-w-4xl mx-auto overflow-y-auto flex-1">
         <!-- 基本信息 -->
         <div class="space-y-4 mb-6">
           <h3 class="font-bold text-lg">基本信息</h3>
           <div class="grid grid-cols-2 gap-3">
-            <label class="text-sm">名称<input v-model="form.name" placeholder="留空将自动生成" class="w-full h-9 px-2 rounded border" :class="isDark? 'bg-[#233648] border-[#324d67]': 'bg-white border-[#cfdbe7]'" /></label>
+            <label class="text-sm">名称前缀<input v-model="form.namePrefix" placeholder="例如：测试" class="w-full h-9 px-2 rounded border" :class="isDark? 'bg-[#233648] border-[#324d67]': 'bg-white border-[#cfdbe7]'" /></label>
+            <label class="text-sm">创建数量<input v-model.number="form.count" type="number" min="1" max="100" class="w-full h-9 px-2 rounded border" :class="isDark? 'bg-[#233648] border-[#324d67]': 'bg-white border-[#cfdbe7]'" /></label>
             <label class="text-sm">项目<input v-model="form.project" class="w-full h-9 px-2 rounded border" :class="isDark? 'bg-[#233648] border-[#324d67]': 'bg-white border-[#cfdbe7]'" /></label>
-            <label class="text-sm col-span-2">代理<input v-model="form.proxy" placeholder="例如：http://proxy.example:8080 或 socks5://proxy.example:1080" class="w-full h-9 px-2 rounded border" :class="isDark? 'bg-[#233648] border-[#324d67]': 'bg-white border-[#cfdbe7]'" /></label>
+            <label class="text-sm">代理<input v-model="form.proxy" placeholder="例如：http://proxy.example:8080 或 socks5://proxy.example:1080" class="w-full h-9 px-2 rounded border" :class="isDark? 'bg-[#233648] border-[#324d67]': 'bg-white border-[#cfdbe7]'" /></label>
+          </div>
+          <div class="text-xs" :class="isDark ? 'text-[#92adc9]' : 'text-[#4c739a]'">
+            将创建 {{ form.count }} 个浏览器，名称为：{{ form.namePrefix || '前缀' }}-1, {{ form.namePrefix || '前缀' }}-2 ... {{ form.namePrefix || '前缀' }}-{{ form.count }}
           </div>
         </div>
 
@@ -254,7 +273,7 @@ function submit(){
       </div>
       <div class="mt-4 flex justify-end gap-2">
         <button class="h-9 px-4 rounded" :class="isDark ? 'bg-[#1a2835] text-[#4c739a]' : 'bg-slate-100 text-slate-400'" @click="close">取消</button>
-        <button class="h-9 px-4 rounded" :class="isDark ? 'bg-[#233648] text-white' : 'bg-[#e7edf3] text-[#0d141b]'" @click="submit">立即创建</button>
+        <button class="h-9 px-4 rounded" :class="isDark ? 'bg-[#233648] text-white' : 'bg-[#e7edf3] text-[#0d141b]'" @click="submit">批量创建</button>
       </div>
     </div>
   </div>

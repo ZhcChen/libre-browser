@@ -10,13 +10,13 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
-use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
 use image::{ImageBuffer, Rgba};
 use sha2::{Digest, Sha256};
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::{Child, Command, Stdio};
 use std::{thread, time::Duration};
 
@@ -973,14 +973,49 @@ fn browser_open(
     browser_name: Option<&str>,
 ) -> Result<Option<u32>, String> {
     let lbl = format!("browser-{}", label);
-    let default_title = format!("Libre Browser - {}", label);
-    let display_title = window_title.unwrap_or(&default_title);
-    let display_name = browser_name.unwrap_or(label);
+    let cleaned_window_title = window_title.and_then(|t| {
+        let trimmed = t.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    });
+    let display_name = browser_name
+        .and_then(|n| {
+            let trimmed = n.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+        .or_else(|| {
+            cleaned_window_title.as_ref().and_then(|title| {
+                if let Some((head, _)) = title.split_once(" - ") {
+                    let name = head.trim();
+                    if name.is_empty() {
+                        None
+                    } else {
+                        Some(name.to_string())
+                    }
+                } else {
+                    Some(title.clone())
+                }
+            })
+        })
+        .unwrap_or_else(|| label.to_string());
+    let default_title = format!("{} - Libre Browser", display_name);
+    let display_title = cleaned_window_title.unwrap_or_else(|| default_title.clone());
     write_log(
         "INFO",
         &format!(
             "browser_open label={} version={:?} url={:?} title={:?} name={:?}",
-            label, version, url, display_title, display_name
+            label,
+            version,
+            url,
+            display_title,
+            display_name
         ),
     );
     // If we already spawned a process for this label and it's running, do nothing
@@ -1021,7 +1056,7 @@ fn browser_open(
             let hash = hasher.finalize();
             let icon_index = (hash[0] as usize) % 1000; // 0-999的索引
 
-            match generate_browser_icon(display_name, icon_index) {
+            match generate_browser_icon(&display_name, icon_index) {
                 Ok(icon_path) => {
                     // 创建自定义App Bundle
                     match bin
@@ -1030,7 +1065,7 @@ fn browser_open(
                         .and_then(|p| p.parent())
                     {
                         Some(source_app) => {
-                            match create_custom_app_bundle(source_app, display_name, &icon_path) {
+                            match create_custom_app_bundle(source_app, &display_name, &icon_path) {
                                 Ok(custom_app) => {
                                     // 获取自定义app目录
                                     let app_dir = custom_app.parent().map(|p| p.to_path_buf());
@@ -1374,7 +1409,7 @@ fn browser_open(
     let to_url = url.unwrap_or("https://example.com");
     let parsed: url::Url = to_url.parse().map_err(|e: url::ParseError| e.to_string())?;
     WebviewWindowBuilder::new(&app, lbl, WebviewUrl::External(parsed))
-        .title("Libre Browser Tab")
+        .title(&display_title)
         .build()
         .map_err(|e| {
             let msg = format!("webview build failed: {e}");
@@ -1492,6 +1527,52 @@ fn browser_running(label: &str) -> Option<u32> {
     None
 }
 
+fn shutdown_all_browsers(app: &AppHandle) {
+    let mut labels: HashSet<String> = HashSet::new();
+
+    if let Ok(m) = proc_map().lock() {
+        labels.extend(m.keys().cloned());
+    }
+
+    let profiles_root = profiles_dir_path();
+    if let Ok(entries) = fs::read_dir(&profiles_root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.join("pid").exists() {
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                        labels.insert(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    for key in app.webview_windows().keys() {
+        if let Some(stripped) = key.strip_prefix("browser-") {
+            labels.insert(stripped.to_string());
+        }
+    }
+
+    if labels.is_empty() {
+        return;
+    }
+
+    write_log(
+        "INFO",
+        &format!("shutdown_all_browsers closing {} labels", labels.len()),
+    );
+
+    for label in labels.into_iter() {
+        if let Err(e) = browser_close(app.clone(), &label) {
+            write_log(
+                "ERROR",
+                &format!("shutdown_all_browsers {} failed: {}", label, e),
+            );
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn try_find_pid_by_profile(profile_dir: &Path, timeout_ms: u64) -> Option<u32> {
     let end = std::time::Instant::now() + Duration::from_millis(timeout_ms);
@@ -1551,9 +1632,18 @@ pub fn run() {
     let _ = rotate_logs();
     write_log("INFO", "应用启动");
 
-    tauri::Builder::default()
+    let context = tauri::generate_context!();
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_http::init())
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { .. } = event {
+                if window.label() == "main" {
+                    let handle = window.app_handle();
+                    shutdown_all_browsers(&handle);
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             logs_dir,
             log_info,
@@ -1568,6 +1658,13 @@ pub fn run() {
             browser_running,
             read_logs_tail
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(context)
+        .expect("error while building tauri application");
+
+    app.run(|app_handle, event| match event {
+        RunEvent::ExitRequested { .. } | RunEvent::Exit => {
+            shutdown_all_browsers(&app_handle);
+        }
+        _ => {}
+    });
 }
