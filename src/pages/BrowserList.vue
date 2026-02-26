@@ -17,6 +17,7 @@ type BrowserProfile = {
   opened: boolean;
   fingerprint?: string;
   proxy?: string;
+  disableCors?: boolean;
   status?: BrowserStatus;
   engineVersion?: string;
   pid?: number;
@@ -119,7 +120,10 @@ async function toggleOpen(p: BrowserProfile) {
         url: null,
         version: p.engineVersion || null,
         windowTitle: displayTitle,
-        browser_name: p.name
+        browserName: p.name,
+        browser_name: p.name,
+        disableCors: !!p.disableCors,
+        disable_cors: !!p.disableCors
       });
       if (pid && typeof pid === 'number') { (p as any).pid = pid; }
       // 不直接置为 open，交由轮询在达到最短展示时长后切换
@@ -147,6 +151,14 @@ function statusClass(s?: BrowserStatus) {
     case "closing": return "text-yellow-400";
     default: return "text-gray-400";
   }
+}
+function isToggleBusy(p: BrowserProfile) {
+  return p.status === "opening" || p.status === "closing";
+}
+function toggleButtonLabel(p: BrowserProfile) {
+  if (p.status === "opening") return "开启中";
+  if (p.status === "closing") return "关闭中";
+  return p.opened ? "关闭" : "启动";
 }
 const showCreate = ref(false);
 const showBatchCreate = ref(false);
@@ -181,6 +193,7 @@ async function appendProfiles(forms: any[]) {
       opened: false,
       fingerprint: JSON.stringify(form?.fingerprint ?? {}),
       proxy: form?.proxy || "",
+      disableCors: !!form?.disableCors,
       status: "closed",
       engineVersion: form?.engineVersion || defaultEngine,
       windowTitle: `${displayName} - Libre Browser`
@@ -353,7 +366,10 @@ async function bulkOpen() {
         url: null,
         version: p.engineVersion || null,
         windowTitle: displayTitle,
-        browser_name: p.name
+        browserName: p.name,
+        browser_name: p.name,
+        disableCors: !!p.disableCors,
+        disable_cors: !!p.disableCors
       });
       if (pid && typeof pid === 'number') { (p as any).pid = pid; }
       // 交由轮询切换到 open
@@ -452,7 +468,21 @@ async function onBatchCreate(payloads: any[]) {
             <td class="h-[72px] px-4 py-2 w-[180px] text-sm font-normal leading-normal" :class="isDark ? 'text-[#92adc9]' : 'text-[#4c739a]'">{{ p.engineVersion || '-' }}</td>
             <td class="h-[72px] px-4 py-2 w-[300px] text-sm font-normal leading-normal" :class="isDark ? 'text-[#92adc9]' : 'text-[#4c739a]'">{{ p.proxy || '未配置' }}</td>
             <td class="h-[72px] px-4 py-2 w-[140px] text-sm font-normal leading-normal"><span :class="statusClass(p.status)">{{ statusLabel(p.status) }}</span></td>
-            <td class="h-[72px] px-4 py-2 w-60 text-sm font-bold leading-normal tracking-[0.015em] whitespace-nowrap" :class="isDark ? 'text-[#92adc9]' : 'text-[#4c739a]'"><button class="mr-3" :class="isDark ? 'text-white' : 'text-[#0d141b]'" @click="toggleOpen(p)">{{ p.opened ? '关闭' : '启动' }}</button><button class="mr-3" :class="isDark ? 'text-white' : 'text-[#0d141b]'" @click="edit(p)">编辑</button><button :class="isDark ? 'text-white' : 'text-[#0d141b]'" @click="removeOne(p)">删除</button></td>
+            <td class="h-[72px] px-4 py-2 w-60 text-sm font-bold leading-normal tracking-[0.015em] whitespace-nowrap" :class="isDark ? 'text-[#92adc9]' : 'text-[#4c739a]'">
+              <button
+                class="mr-3"
+                :class="[
+                  isDark ? 'text-white' : 'text-[#0d141b]',
+                  isToggleBusy(p) ? 'opacity-50 cursor-not-allowed' : ''
+                ]"
+                :disabled="isToggleBusy(p)"
+                @click="toggleOpen(p)"
+              >
+                {{ toggleButtonLabel(p) }}
+              </button>
+              <button class="mr-3" :class="isDark ? 'text-white' : 'text-[#0d141b]'" @click="edit(p)">编辑</button>
+              <button :class="isDark ? 'text-white' : 'text-[#0d141b]'" @click="removeOne(p)">删除</button>
+            </td>
           </tr>
         </template>
       </AppTable>

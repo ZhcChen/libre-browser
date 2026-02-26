@@ -963,6 +963,50 @@ fn fix_macos_exec_and_quarantine(root: &PathBuf) {
 #[cfg(not(target_os = "macos"))]
 fn fix_macos_exec_and_quarantine(_root: &PathBuf) {}
 
+fn build_engine_launch_args(
+    profile_dir: &Path,
+    crash_dir: &Path,
+    log_file: &Path,
+    want_restore: bool,
+    url: Option<&str>,
+    display_title: &str,
+    disable_cors: bool,
+) -> Vec<String> {
+    let mut args = vec![
+        format!("--user-data-dir={}", profile_dir.to_string_lossy()),
+        "--no-first-run".to_string(),
+        "--no-default-browser-check".to_string(),
+    ];
+    if want_restore {
+        args.push("--restore-last-session".into());
+    } else if let Some(u) = url {
+        args.push("--new-window".into());
+        args.push(u.to_string());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // 避免触发钥匙串访问提示
+        args.push("--password-store=basic".into());
+        args.push("--use-mock-keychain".into());
+    }
+    // 减少提示条
+    args.push("--test-type".into());
+    args.push("--disable-infobars".into());
+    // 可选关闭跨域限制
+    if disable_cors {
+        args.push("--disable-web-security".into());
+        args.push("--disable-site-isolation-trials".into());
+    }
+    // 设置窗口标题（Chromium 支持）
+    args.push(format!("--window-name={}", display_title));
+    // 打开 Chromium 日志
+    args.push("--enable-logging=1".into());
+    args.push("--v=1".into());
+    args.push(format!("--log-file={}", log_file.to_string_lossy()));
+    args.push(format!("--crash-dumps-dir={}", crash_dir.to_string_lossy()));
+    args
+}
+
 #[tauri::command]
 fn browser_open(
     app: AppHandle,
@@ -971,6 +1015,7 @@ fn browser_open(
     version: Option<&str>,
     window_title: Option<&str>,
     browser_name: Option<&str>,
+    disable_cors: Option<bool>,
 ) -> Result<Option<u32>, String> {
     let lbl = format!("browser-{}", label);
     let cleaned_window_title = window_title.and_then(|t| {
@@ -1007,15 +1052,17 @@ fn browser_open(
         .unwrap_or_else(|| label.to_string());
     let default_title = format!("{} - Libre Browser", display_name);
     let display_title = cleaned_window_title.unwrap_or_else(|| default_title.clone());
+    let disable_cors_enabled = disable_cors.unwrap_or(false);
     write_log(
         "INFO",
         &format!(
-            "browser_open label={} version={:?} url={:?} title={:?} name={:?}",
+            "browser_open label={} version={:?} url={:?} title={:?} name={:?} disable_cors={}",
             label,
             version,
             url,
             display_title,
-            display_name
+            display_name,
+            disable_cors_enabled
         ),
     );
     // If we already spawned a process for this label and it's running, do nothing
@@ -1156,33 +1203,15 @@ fn browser_open(
         let crash_dir = profile_dir.join("crashes");
         ensure_dir(&crash_dir);
         let log_file = chrome_log_path(label);
-        let mut args = vec![
-            format!("--user-data-dir={}", profile_dir.to_string_lossy()),
-            "--no-first-run".to_string(),
-            "--no-default-browser-check".to_string(),
-        ];
-        if want_restore {
-            args.push("--restore-last-session".into());
-        } else if let Some(u) = url {
-            args.push("--new-window".into());
-            args.push(u.to_string());
-        }
-        #[cfg(target_os = "macos")]
-        {
-            // 避免触发钥匙串访问提示
-            args.push("--password-store=basic".into());
-            args.push("--use-mock-keychain".into());
-        }
-        // 减少提示条
-        args.push("--test-type".into());
-        args.push("--disable-infobars".into());
-        // 设置窗口标题（Chromium 支持）
-        args.push(format!("--window-name={}", display_title));
-        // 打开 Chromium 日志
-        args.push("--enable-logging=1".into());
-        args.push("--v=1".into());
-        args.push(format!("--log-file={}", log_file.to_string_lossy()));
-        args.push(format!("--crash-dumps-dir={}", crash_dir.to_string_lossy()));
+        let args = build_engine_launch_args(
+            &profile_dir,
+            &crash_dir,
+            &log_file,
+            want_restore,
+            url,
+            &display_title,
+            disable_cors_enabled,
+        );
         #[cfg(target_os = "macos")]
         {
             // 优先通过 open 打开自定义或原始 .app，避免 GUI 激活问题
@@ -1621,6 +1650,43 @@ fn read_logs_tail(lines: usize) -> Result<String, String> {
     let v: Vec<&str> = content.lines().collect();
     let n = lines.min(v.len());
     Ok(v[v.len() - n..].join("\n"))
+}
+
+#[cfg(test)]
+mod browser_open_tests {
+    use super::*;
+
+    #[test]
+    fn test_build_engine_launch_args_contains_disable_cors_flags_when_enabled() {
+        let args = build_engine_launch_args(
+            Path::new("/tmp/profile"),
+            Path::new("/tmp/crashes"),
+            Path::new("/tmp/chrome.log"),
+            false,
+            Some("https://example.com"),
+            "Test Browser - Libre Browser",
+            true,
+        );
+
+        assert!(args.contains(&"--disable-web-security".to_string()));
+        assert!(args.contains(&"--disable-site-isolation-trials".to_string()));
+    }
+
+    #[test]
+    fn test_build_engine_launch_args_no_disable_cors_flags_when_disabled() {
+        let args = build_engine_launch_args(
+            Path::new("/tmp/profile"),
+            Path::new("/tmp/crashes"),
+            Path::new("/tmp/chrome.log"),
+            false,
+            Some("https://example.com"),
+            "Test Browser - Libre Browser",
+            false,
+        );
+
+        assert!(!args.contains(&"--disable-web-security".to_string()));
+        assert!(!args.contains(&"--disable-site-isolation-trials".to_string()));
+    }
 }
 
 #[cfg(test)]

@@ -45,7 +45,8 @@ const form = reactive({
     cookiesEnabled: navigator.cookieEnabled,
     doNotTrack: navigator.doNotTrack
   },
-  proxy: ''
+  proxy: '',
+  disableCors: false
 });
 function close(){ emit('update:modelValue', false); }
 function submit(){
@@ -71,6 +72,15 @@ function submit(){
             <label class="text-sm">名称<input v-model="form.name" placeholder="留空将自动生成" class="w-full h-9 px-2 rounded border" :class="isDark? 'bg-[#233648] border-[#324d67]': 'bg-white border-[#cfdbe7]'" /></label>
             <label class="text-sm">项目<input v-model="form.project" class="w-full h-9 px-2 rounded border" :class="isDark? 'bg-[#233648] border-[#324d67]': 'bg-white border-[#cfdbe7]'" /></label>
             <label class="text-sm col-span-2">代理<input v-model="form.proxy" placeholder="例如：http://proxy.example:8080 或 socks5://proxy.example:1080" class="w-full h-9 px-2 rounded border" :class="isDark? 'bg-[#233648] border-[#324d67]': 'bg-white border-[#cfdbe7]'" /></label>
+            <label class="text-sm col-span-2 flex items-center gap-2">
+              <input
+                v-model="form.disableCors"
+                type="checkbox"
+                class="h-4 w-4 rounded border"
+                :class="isDark ? 'border-[#324d67] bg-[#233648]' : 'border-[#cfdbe7] bg-white'"
+              />
+              <span>关闭跨域限制（启动时追加参数）</span>
+            </label>
           </div>
         </div>
 
