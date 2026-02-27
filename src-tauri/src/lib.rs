@@ -29,6 +29,20 @@ pub struct EngineInfo {
     pub installed_at: String,
 }
 
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+struct ProfileAssetsMeta {
+    custom_app_path: Option<String>,
+    custom_icon_path: Option<String>,
+}
+
+#[derive(Debug, Serialize, Default, Clone)]
+struct CacheCleanupSummary {
+    removed_profiles: usize,
+    removed_custom_apps: usize,
+    removed_custom_icons: usize,
+    warnings: Vec<String>,
+}
+
 fn logs_dir_path() -> PathBuf {
     // 优先使用系统推荐目录；失败则回退到 $HOME/.libre-browser/logs
     if let Some(proj) = ProjectDirs::from("com", "chen", "libre-browser") {
@@ -159,6 +173,209 @@ fn profile_dir_path(label: &str) -> PathBuf {
 
 fn chrome_log_path(label: &str) -> PathBuf {
     profile_dir_path(label).join("chrome_debug.log")
+}
+
+fn profile_assets_meta_path(label: &str) -> PathBuf {
+    profile_dir_path(label).join("assets.json")
+}
+
+fn read_profile_assets_meta(profile_dir: &Path) -> Option<ProfileAssetsMeta> {
+    let p = profile_dir.join("assets.json");
+    let mut f = File::open(&p).ok()?;
+    let mut s = String::new();
+    f.read_to_string(&mut s).ok()?;
+    serde_json::from_str::<ProfileAssetsMeta>(&s).ok()
+}
+
+fn write_profile_assets_meta(label: &str, meta: &ProfileAssetsMeta) {
+    let path = profile_assets_meta_path(label);
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    match serde_json::to_string_pretty(meta) {
+        Ok(content) => {
+            if let Err(e) = fs::write(&path, content) {
+                write_log(
+                    "WARN",
+                    &format!(
+                        "write_profile_assets_meta failed label={} path={} err={}",
+                        label,
+                        path.to_string_lossy(),
+                        e
+                    ),
+                );
+            }
+        }
+        Err(e) => {
+            write_log(
+                "WARN",
+                &format!("serialize profile assets meta failed label={} err={}", label, e),
+            );
+        }
+    }
+}
+
+fn remove_managed_path(path: &Path) -> Result<bool, String> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let base = data_local_base();
+    if !path.starts_with(&base) {
+        return Err(format!(
+            "refuse to remove unmanaged path {}",
+            path.to_string_lossy()
+        ));
+    }
+    if path.is_dir() {
+        fs::remove_dir_all(path).map_err(|e| format!("remove dir failed: {e}"))?;
+    } else {
+        fs::remove_file(path).map_err(|e| format!("remove file failed: {e}"))?;
+    }
+    Ok(true)
+}
+
+fn merge_cleanup_summary(to: &mut CacheCleanupSummary, from: CacheCleanupSummary) {
+    to.removed_profiles += from.removed_profiles;
+    to.removed_custom_apps += from.removed_custom_apps;
+    to.removed_custom_icons += from.removed_custom_icons;
+    to.warnings.extend(from.warnings);
+}
+
+fn cleanup_profile_files(label: &str) -> CacheCleanupSummary {
+    let mut summary = CacheCleanupSummary::default();
+    let profile_dir = profile_dir_path(label);
+    if !profile_dir.exists() {
+        return summary;
+    }
+
+    if let Some(meta) = read_profile_assets_meta(&profile_dir) {
+        if let Some(app_path) = meta.custom_app_path {
+            let p = PathBuf::from(app_path);
+            match remove_managed_path(&p) {
+                Ok(true) => summary.removed_custom_apps += 1,
+                Ok(false) => {}
+                Err(e) => summary.warnings.push(format!(
+                    "remove custom app failed label={} path={} err={}",
+                    label,
+                    p.to_string_lossy(),
+                    e
+                )),
+            }
+        }
+        if let Some(icon_path) = meta.custom_icon_path {
+            let p = PathBuf::from(icon_path);
+            match remove_managed_path(&p) {
+                Ok(true) => summary.removed_custom_icons += 1,
+                Ok(false) => {}
+                Err(e) => summary.warnings.push(format!(
+                    "remove custom icon failed label={} path={} err={}",
+                    label,
+                    p.to_string_lossy(),
+                    e
+                )),
+            }
+        }
+    }
+
+    match fs::remove_dir_all(&profile_dir) {
+        Ok(()) => {
+            summary.removed_profiles += 1;
+        }
+        Err(e) => {
+            summary.warnings.push(format!(
+                "remove profile dir failed label={} path={} err={}",
+                label,
+                profile_dir.to_string_lossy(),
+                e
+            ));
+        }
+    }
+    summary
+}
+
+fn collect_active_asset_refs(active_labels: &HashSet<String>) -> (HashSet<PathBuf>, HashSet<PathBuf>) {
+    let mut app_refs = HashSet::new();
+    let mut icon_refs = HashSet::new();
+
+    for label in active_labels {
+        let profile_dir = profile_dir_path(label);
+        if !profile_dir.exists() {
+            continue;
+        }
+        if let Some(meta) = read_profile_assets_meta(&profile_dir) {
+            if let Some(app_path) = meta.custom_app_path {
+                app_refs.insert(PathBuf::from(app_path));
+            }
+            if let Some(icon_path) = meta.custom_icon_path {
+                icon_refs.insert(PathBuf::from(icon_path));
+            }
+        }
+    }
+
+    (app_refs, icon_refs)
+}
+
+fn cleanup_orphan_assets(active_labels: &HashSet<String>) -> CacheCleanupSummary {
+    let mut summary = CacheCleanupSummary::default();
+    let (active_apps, active_icons) = collect_active_asset_refs(active_labels);
+    let base = data_local_base();
+    let custom_apps_dir = base.join("custom_apps");
+    let custom_icons_dir = base.join("custom_icons");
+
+    if let Ok(entries) = fs::read_dir(&custom_apps_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if active_apps.contains(&path) {
+                continue;
+            }
+            match remove_managed_path(&path) {
+                Ok(true) => summary.removed_custom_apps += 1,
+                Ok(false) => {}
+                Err(e) => summary.warnings.push(format!(
+                    "remove orphan custom app failed path={} err={}",
+                    path.to_string_lossy(),
+                    e
+                )),
+            }
+        }
+    }
+
+    if let Ok(entries) = fs::read_dir(&custom_icons_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if active_icons.contains(&path) {
+                continue;
+            }
+            match remove_managed_path(&path) {
+                Ok(true) => summary.removed_custom_icons += 1,
+                Ok(false) => {}
+                Err(e) => summary.warnings.push(format!(
+                    "remove orphan custom icon failed path={} err={}",
+                    path.to_string_lossy(),
+                    e
+                )),
+            }
+        }
+    }
+
+    summary
+}
+
+fn collect_existing_profile_labels() -> HashSet<String> {
+    let mut labels = HashSet::new();
+    let root = profiles_dir_path();
+    if let Ok(entries) = fs::read_dir(&root) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if !p.is_dir() {
+                continue;
+            }
+            if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                labels.insert(name.to_string());
+            }
+        }
+    }
+    labels
 }
 
 fn ensure_dir(p: &PathBuf) {
@@ -1094,6 +1311,9 @@ fn browser_open(
         );
     }
     if let Some(bin) = engine_bin {
+        let profile_dir = profile_dir_path(label);
+        let _ = fs::create_dir_all(&profile_dir);
+        let mut profile_assets = ProfileAssetsMeta::default();
         // 生成自定义图标和App Bundle（仅在macOS上）
         #[allow(unused_variables)]
         let (custom_app, app_dir) = if cfg!(target_os = "macos") {
@@ -1105,6 +1325,7 @@ fn browser_open(
 
             match generate_browser_icon(&display_name, icon_index) {
                 Ok(icon_path) => {
+                    profile_assets.custom_icon_path = Some(icon_path.to_string_lossy().to_string());
                     // 创建自定义App Bundle
                     match bin
                         .parent()
@@ -1114,6 +1335,8 @@ fn browser_open(
                         Some(source_app) => {
                             match create_custom_app_bundle(source_app, &display_name, &icon_path) {
                                 Ok(custom_app) => {
+                                    profile_assets.custom_app_path =
+                                        Some(custom_app.to_string_lossy().to_string());
                                     // 获取自定义app目录
                                     let app_dir = custom_app.parent().map(|p| p.to_path_buf());
                                     match app_dir {
@@ -1198,8 +1421,7 @@ fn browser_open(
                 fix_macos_exec_and_quarantine(&app_dir.to_path_buf());
             }
         }
-        let profile_dir = profile_dir_path(label);
-        let _ = fs::create_dir_all(&profile_dir);
+        write_profile_assets_meta(label, &profile_assets);
         let crash_dir = profile_dir.join("crashes");
         ensure_dir(&crash_dir);
         let log_file = chrome_log_path(label);
@@ -1507,6 +1729,94 @@ fn browser_close(app: AppHandle, label: &str) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn browser_delete(app: AppHandle, label: &str) -> Result<CacheCleanupSummary, String> {
+    let mut summary = CacheCleanupSummary::default();
+
+    if let Err(e) = browser_close(app, label) {
+        summary
+            .warnings
+            .push(format!("close before delete failed label={} err={}", label, e));
+    }
+
+    merge_cleanup_summary(&mut summary, cleanup_profile_files(label));
+
+    let active_labels = collect_existing_profile_labels();
+    merge_cleanup_summary(&mut summary, cleanup_orphan_assets(&active_labels));
+
+    write_log(
+        "INFO",
+        &format!(
+            "browser_delete label={} removed_profiles={} removed_custom_apps={} removed_custom_icons={} warnings={}",
+            label,
+            summary.removed_profiles,
+            summary.removed_custom_apps,
+            summary.removed_custom_icons,
+            summary.warnings.len()
+        ),
+    );
+
+    Ok(summary)
+}
+
+#[tauri::command]
+fn cleanup_stale_browser_cache(
+    app: AppHandle,
+    active_labels: Vec<String>,
+) -> Result<CacheCleanupSummary, String> {
+    let active_set: HashSet<String> = active_labels
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let mut summary = CacheCleanupSummary::default();
+    let profiles_root = profiles_dir_path();
+
+    if let Ok(entries) = fs::read_dir(&profiles_root) {
+        for entry in entries.flatten() {
+            let profile_path = entry.path();
+            if !profile_path.is_dir() {
+                continue;
+            }
+            let Some(label) = profile_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string())
+            else {
+                continue;
+            };
+            if active_set.contains(&label) {
+                continue;
+            }
+
+            if let Err(e) = browser_close(app.clone(), &label) {
+                summary.warnings.push(format!(
+                    "close stale profile failed label={} err={}",
+                    label, e
+                ));
+            }
+            merge_cleanup_summary(&mut summary, cleanup_profile_files(&label));
+        }
+    }
+
+    merge_cleanup_summary(&mut summary, cleanup_orphan_assets(&active_set));
+
+    write_log(
+        "INFO",
+        &format!(
+            "cleanup_stale_browser_cache active={} removed_profiles={} removed_custom_apps={} removed_custom_icons={} warnings={}",
+            active_set.len(),
+            summary.removed_profiles,
+            summary.removed_custom_apps,
+            summary.removed_custom_icons,
+            summary.warnings.len()
+        ),
+    );
+
+    Ok(summary)
+}
+
+#[tauri::command]
 fn browser_exists(app: AppHandle, label: &str) -> Result<bool, String> {
     // Check spawned process
     if let Ok(mut m) = proc_map().lock() {
@@ -1720,8 +2030,10 @@ pub fn run() {
             extract_engine_archive,
             browser_open,
             browser_close,
+            browser_delete,
             browser_exists,
             browser_running,
+            cleanup_stale_browser_cache,
             read_logs_tail
         ])
         .build(context)

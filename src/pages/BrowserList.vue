@@ -76,10 +76,17 @@ const confirmVisible = ref(false);
 const confirmMsg = ref("");
 let confirmAction: null | (() => Promise<void> | void) = null;
 async function onConfirm() { const fn = confirmAction; confirmVisible.value = false; confirmAction = null; if (fn) await fn(); }
+async function deleteBrowserAndData(label: string) {
+  try {
+    await invoke("browser_delete", { label });
+    return;
+  } catch {}
+  try { await invoke("browser_close", { label }); } catch {}
+}
 async function removeOne(p: BrowserProfile) {
   confirmMsg.value = `确认删除 ${p.name}？`;
   confirmAction = async () => {
-    try { if (p.status === "open" || p.status === "opening") { try { await invoke("browser_close", { label: p.id }); } catch {} } }
+    try { await deleteBrowserAndData(p.id); }
     finally { state.profiles = state.profiles.filter((x) => x.id !== p.id); selected.delete(p.id); save(); }
   };
   confirmVisible.value = true;
@@ -343,7 +350,7 @@ async function bulkDelete() {
     for (const id of ids) {
       const p = state.profiles.find(x => x.id === id);
       if (!p) continue;
-      if (p.status === "open" || p.status === "opening") { try { await invoke("browser_close", { label: p.id }); } catch {} }
+      await deleteBrowserAndData(p.id);
     }
     state.profiles = state.profiles.filter((p) => !selected.has(p.id));
     selected.clear();
